@@ -246,8 +246,32 @@ bad += report("line_stmt", rstmt, mstmt, "rows")
 sys.exit(1 if bad else 0)
 PY
 
+# One binary from the wild, if the system ships one: our own fixtures are all
+# gcc/clang on tiny C, and a third-party producer at scale (Go, Rust, a
+# distro package) exercises tag/attribute codes and line tables we would never
+# generate ourselves. Skipped silently when nothing suitable is installed.
+wild=""
+for cand in $(grep -lsa -m1 '\.debug_info' /usr/bin/* /usr/lib/debug/* 2>/dev/null | head -20); do
+	[ -f "$cand" ] || continue
+	line=$(readelf -S -W "$cand" 2>/dev/null | grep ' \.debug_info ') || continue
+	[ -n "$line" ] || continue
+	# "C" in the flags column means SHF_COMPRESSED; we deliberately refuse to
+	# link zlib, so hand it to objcopy first - the upgrade path our own error
+	# message names.
+	if printf '%s' "$line" | grep -q ' C  '; then
+		command -v objcopy >/dev/null || continue
+		objcopy --decompress-debug-sections "$cand" "$work/wild" 2>/dev/null \
+			|| continue
+	else
+		cp "$cand" "$work/wild" 2>/dev/null || continue
+	fi
+	wild="wild"
+	echo "--- wild binary: $cand"
+	break
+done
+
 echo "--- oracle: readelf --debug-dump=info / =decodedline"
-for b in $bins; do
+for b in $bins $wild; do
 	[ -n "$b" ] || continue
 	out=$(python3 "$work/cmp.py" "$work/$b" "$b" "$DD")
 	echo "$out"

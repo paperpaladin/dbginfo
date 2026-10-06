@@ -371,6 +371,12 @@ static const NameEnt tags[] = {
 #define DW_AT_defaulted 0x8b
 #define DW_AT_loclists_base 0x8c
 #define DW_AT_GNU_call_site_value 0x2111
+#define DW_AT_GNU_dwo_name 0x2130
+#define DW_AT_GNU_dwo_id 0x2131
+#define DW_AT_GNU_ranges_base 0x2132
+#define DW_AT_GNU_addr_base 0x2133
+#define DW_AT_GNU_pubnames 0x2134
+#define DW_AT_GNU_pubtypes 0x2135
 #define DW_AT_GNU_all_tail_call_sites 0x2116
 #define DW_AT_GNU_all_call_sites 0x2117
 #define DW_AT_GNU_macros 0x2119
@@ -419,6 +425,8 @@ static const NameEnt attrs[] = {
 	N(DW_AT_call_data_location), N(DW_AT_call_data_value), N(DW_AT_noreturn),
 	N(DW_AT_alignment), N(DW_AT_export_symbols), N(DW_AT_deleted),
 	N(DW_AT_defaulted), N(DW_AT_loclists_base), N(DW_AT_GNU_call_site_value),
+	N(DW_AT_GNU_dwo_name), N(DW_AT_GNU_dwo_id), N(DW_AT_GNU_ranges_base),
+	N(DW_AT_GNU_addr_base), N(DW_AT_GNU_pubnames), N(DW_AT_GNU_pubtypes),
 	N(DW_AT_GNU_all_tail_call_sites), N(DW_AT_GNU_all_call_sites),
 	N(DW_AT_GNU_macros), N(DW_AT_GNU_locviews), N(DW_AT_GNU_entry_view),
 };
