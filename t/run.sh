@@ -103,6 +103,11 @@ int main()
 CPP
 	add "$(build cpp5 g++ -g -O0 "$S/cls.cpp")"
 fi
+if command -v clang >/dev/null; then
+	# clang is worth a row of its own: it is the producer that actually uses
+	# DW_FORM_strx*/addrx*, which gcc only emits for split DWARF.
+	add "$(build c5 clang -g -O0 "$S/main.c" "$S/lib.c")"
+fi
 
 # ---------------------------------------------------------------- extractor
 cat > "$work/cmp.py" <<'PY'
