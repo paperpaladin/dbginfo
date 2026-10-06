@@ -812,17 +812,19 @@ typedef struct {
 	uint64_t cu_off;	/* .debug_info offset of this CU header */
 } Cu;
 
-enum { V_NONE, V_U, V_S, V_UNRES };
+enum { V_NONE, V_U, V_S, V_STR, V_UNRES };
 
 typedef struct {
 	int kind;
 	uint64_t form;
 	uint64_t u;
 	int64_t s;
+	const char *str;
 	const char *why;	/* set when kind == V_UNRES */
 } Val;
 
-static int read_form(Rd *r, const Cu *cu, uint64_t form, int64_t ic, Val *v)
+static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
+                     Val *v)
 {
 	memset(v, 0, sizeof *v);
 	v->form = form;
@@ -844,6 +846,38 @@ static int read_form(Rd *r, const Cu *cu, uint64_t form, int64_t ic, Val *v)
 		v->kind = V_U;
 		v->u = rd_fixed(r, cu->off_size);
 		break;
+	case DW_FORM_string: {
+		/* Inline NUL-terminated string living in .debug_info itself. */
+		size_t start = r->pos;
+		for (;;) {
+			if (!rd_left(r, 1)) {
+				r->err = 1;
+				return 0;
+			}
+			if (rd_u8(r) == 0)
+				break;
+		}
+		v->kind = V_STR;
+		v->str = (const char *)r->buf + start;
+		break;
+	}
+	case DW_FORM_strp: {
+		uint64_t off = rd_fixed(r, cu->off_size);
+		v->str = sec_str(e->str, off);
+		v->kind = v->str ? V_STR : V_UNRES;
+		v->u = off;
+		v->why = e->str ? "bad .debug_str offset" : "no .debug_str";
+		break;
+	}
+	case DW_FORM_line_strp: {
+		uint64_t off = rd_fixed(r, cu->off_size);
+		v->str = sec_str(e->line_str, off);
+		v->kind = v->str ? V_STR : V_UNRES;
+		v->u = off;
+		v->why = e->line_str ? "bad .debug_line_str offset"
+		                     : "no .debug_line_str";
+		break;
+	}
 	default:
 		/* Unknown form: we cannot know its length, so the rest of this CU
 		 * is unparseable. Say so loudly instead of guessing. */
@@ -855,6 +889,9 @@ static int read_form(Rd *r, const Cu *cu, uint64_t form, int64_t ic, Val *v)
 static void print_val(const Val *v, uint64_t at)
 {
 	switch (v->kind) {
+	case V_STR:
+		printf("\"%s\"", v->str);
+		break;
 	case V_S:
 		printf("%" PRId64, v->s);
 		break;
@@ -990,7 +1027,7 @@ static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
 		       code, a->children ? " [children]" : "");
 		for (size_t i = 0; i < a->nattr; i++) {
 			Val v;
-			if (!read_form(r, &cu, a->attr[i].form,
+			if (!read_form(r, e, &cu, a->attr[i].form,
 			               a->attr[i].iconst, &v)) {
 				char fb[64];
 				fprintf(stderr, "dbginfo: CU @0x%" PRIx64 ": DIE 0x%"
