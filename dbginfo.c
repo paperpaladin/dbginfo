@@ -812,7 +812,7 @@ typedef struct {
 	uint64_t cu_off;	/* .debug_info offset of this CU header */
 } Cu;
 
-enum { V_NONE, V_U, V_S, V_STR, V_REF, V_UNRES };
+enum { V_NONE, V_U, V_S, V_STR, V_BLOCK, V_REF, V_UNRES };
 
 typedef struct {
 	int kind;
@@ -820,6 +820,8 @@ typedef struct {
 	uint64_t u;
 	int64_t s;
 	const char *str;
+	const uint8_t *blk;
+	size_t blklen;
 	const char *why;	/* set when kind == V_UNRES */
 } Val;
 
@@ -847,6 +849,12 @@ static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
 		v->u = rd_fixed(r, cu->off_size);
 		break;
 	case DW_FORM_ref_sig8: v->kind = V_U; v->u = rd_u64(r); break;
+	case DW_FORM_data16: {
+		v->kind = V_BLOCK;
+		v->blk = rd_take(r, 16);
+		v->blklen = 16;
+		break;
+	}
 	case DW_FORM_string: {
 		/* Inline NUL-terminated string living in .debug_info itself. */
 		size_t start = r->pos;
@@ -892,6 +900,22 @@ static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
 		v->kind = V_REF;
 		v->u = rd_fixed(r, cu->off_size);
 		break;
+	case DW_FORM_exprloc: case DW_FORM_block: {
+		uint64_t n = rd_uleb(r);
+		v->kind = V_BLOCK;
+		v->blk = rd_take(r, (size_t)n);
+		v->blklen = v->blk ? (size_t)n : 0;
+		break;
+	}
+	case DW_FORM_block1: case DW_FORM_block2: case DW_FORM_block4: {
+		unsigned w = form == DW_FORM_block1 ? 1
+		           : form == DW_FORM_block2 ? 2 : 4;
+		uint64_t n = rd_fixed(r, w);
+		v->kind = V_BLOCK;
+		v->blk = rd_take(r, (size_t)n);
+		v->blklen = v->blk ? (size_t)n : 0;
+		break;
+	}
 	default:
 		/* Unknown form: we cannot know its length, so the rest of this CU
 		 * is unparseable. Say so loudly instead of guessing. */
@@ -900,11 +924,21 @@ static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
 	return !r->err;
 }
 
+static void print_block(const uint8_t *b, size_t n)
+{
+	printf("%zu byte block:", n);
+	for (size_t i = 0; i < n; i++)
+		printf(" %02x", b[i]);
+}
+
 static void print_val(const Val *v, uint64_t at)
 {
 	switch (v->kind) {
 	case V_STR:
 		printf("\"%s\"", v->str);
+		break;
+	case V_BLOCK:
+		print_block(v->blk, v->blklen);
 		break;
 	case V_REF:
 		printf("<0x%" PRIx64 ">", v->u);
