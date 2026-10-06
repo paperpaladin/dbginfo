@@ -1214,6 +1214,325 @@ static int dump_abbrev(Elf *e)
 	return 1;
 }
 
+/* ------------------------------------------------------------------ */
+/* .debug_line                                                        */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+	const char *name;
+	uint64_t dir;
+} FileEnt;
+
+static void fv_push(FileEnt **v, size_t *n, size_t *cap, FileEnt f)
+{
+	if (*n == *cap) {
+		*cap = *cap ? *cap * 2 : 8;
+		FileEnt *nv = realloc(*v, *cap * sizeof **v);
+		if (!nv)
+			die("out of memory");
+		*v = nv;
+	}
+	(*v)[(*n)++] = f;
+}
+
+static int dump_line_prog(Elf *e, Rd *r, uint64_t unit_off, int verbose)
+{
+	Cu cu = { 0 };
+	cu.off_size = 4;
+	cu.addr_size = 8;
+
+	uint64_t ulen = rd_u32(r);
+	if (r->err)
+		return 0;
+	if (ulen == 0xffffffffu) {
+		cu.off_size = 8;
+		ulen = rd_u64(r);
+	} else if (ulen >= 0xfffffff0u) {
+		fprintf(stderr, "dbginfo: line unit @0x%" PRIx64
+		        ": reserved length\n", unit_off);
+		return 0;
+	}
+	if (r->err || ulen > r->len - r->pos) {
+		fprintf(stderr, "dbginfo: line unit @0x%" PRIx64
+		        ": length runs past end of .debug_line\n", unit_off);
+		return 0;
+	}
+	size_t unit_end = r->pos + (size_t)ulen;
+
+	uint64_t ver = rd_u16(r);
+	if (r->err)
+		return 0;
+	/* shortcut: DWARF 5 reshuffled this header (it gained address_size and
+	 * segment_selector_size) and replaced both string lists with
+	 * format-described entry tables. Refuse it for now rather than
+	 * misreading it; upgrade path is a second header branch below. */
+	if (ver < 2 || ver > 4) {
+		fprintf(stderr, "dbginfo: line unit @0x%" PRIx64 ": version %"
+		        PRIu64 " not supported (we handle 2-4)\n", unit_off, ver);
+		return 0;
+	}
+	cu.version = ver;
+	unsigned seg_sel = 0;
+	uint64_t hlen = rd_fixed(r, cu.off_size);
+	size_t prog_start = r->pos + (size_t)hlen;	/* header_length is from here */
+	unsigned min_inst = rd_u8(r);
+	unsigned max_ops = (ver >= 4) ? rd_u8(r) : 1;
+	unsigned default_is_stmt = rd_u8(r);
+	int64_t line_base = (int8_t)rd_u8(r);
+	unsigned line_range = rd_u8(r);
+	unsigned opcode_base = rd_u8(r);
+	if (r->err)
+		return 0;
+	if (min_inst == 0 || line_range == 0 || opcode_base == 0 ||
+	    max_ops == 0 || cu.addr_size == 0 || cu.addr_size > 8) {
+		fprintf(stderr, "dbginfo: line unit @0x%" PRIx64
+		        ": implausible header (min_inst=%u line_range=%u "
+		        "opcode_base=%u max_ops=%u addr_size=%u)\n", unit_off,
+		        min_inst, line_range, opcode_base, max_ops, cu.addr_size);
+		return 0;
+	}
+	uint8_t std_len[256] = { 0 };
+	for (unsigned i = 1; i < opcode_base; i++)
+		std_len[i] = rd_u8(r);
+	if (r->err)
+		return 0;
+
+	printf("line unit @0x%" PRIx64 " len=0x%" PRIx64 " version=%" PRIu64
+	       " addr_size=%u seg_sel=%u min_inst=%u max_ops=%u"
+	       " default_is_stmt=%u line_base=%" PRId64 " line_range=%u"
+	       " opcode_base=%u\n", unit_off, ulen, ver, cu.addr_size, seg_sel,
+	       min_inst, max_ops, default_is_stmt, line_base, line_range,
+	       opcode_base);
+
+	char **dirs = NULL;
+	size_t ndirs = 0, cdirs = 0;
+	FileEnt *files = NULL;
+	size_t nfiles = 0, cfiles = 0;
+	int rc = 1;
+
+	/* DWARF2-4: two NUL-terminated-string lists, each ended by an
+	 * empty string. */
+	for (;;) {
+		Val v;
+		if (!read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
+			rc = 0;
+			goto out;
+		}
+		if (!v.str || !*v.str)
+			break;
+		if (ndirs == cdirs) {
+			cdirs = cdirs ? cdirs * 2 : 8;
+			char **nv = realloc(dirs, cdirs * sizeof *nv);
+			if (!nv) die("out of memory");
+			dirs = nv;
+		}
+		dirs[ndirs++] = (char *)(uintptr_t)v.str;
+	}
+	fv_push(&files, &nfiles, &cfiles, (FileEnt){ NULL, 0 });	/* index 0 */
+	for (;;) {
+		Val v;
+		if (!read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
+			rc = 0;
+			goto out;
+		}
+		if (!v.str || !*v.str)
+			break;
+		FileEnt f = { v.str, rd_uleb(r) };
+		(void)rd_uleb(r);	/* mtime */
+		(void)rd_uleb(r);	/* length */
+		if (r->err) {
+			rc = 0;
+			goto out;
+		}
+		fv_push(&files, &nfiles, &cfiles, f);
+	}
+
+	if (verbose) {
+		printf("  directories:\n");
+		for (size_t i = 0; i < ndirs; i++)
+			printf("    [%zu] %s\n", i, dirs[i] ? dirs[i] : "(none)");
+		printf("  files:\n");
+		for (size_t i = 0; i < nfiles; i++)
+			printf("    [%zu] dir=%" PRIu64 " %s\n", i, files[i].dir,
+			       files[i].name ? files[i].name : "(none)");
+	}
+
+	if (prog_start > unit_end || prog_start < r->pos) {
+		fprintf(stderr, "dbginfo: line unit @0x%" PRIx64
+		        ": header_length 0x%" PRIx64 " inconsistent\n",
+		        unit_off, hlen);
+		rc = 0;
+		goto out;
+	}
+	r->pos = prog_start;
+
+	/* The line program is a bytecode over a row register set (DWARF5
+	 * 6.2.2). Registers reset to these values at the start of every
+	 * sequence and again after DW_LNE_end_sequence. */
+	uint64_t addr = 0, op_index = 0, file = 1, line = 1, col = 0, isa = 0,
+	         disc = 0;
+	int is_stmt = default_is_stmt != 0, basic_block = 0, end_seq = 0,
+	    prologue_end = 0, epilogue_begin = 0;
+#define LINE_RESET() do { \
+		addr = 0; op_index = 0; file = 1; line = 1; col = 0; isa = 0; \
+		disc = 0; is_stmt = default_is_stmt != 0; basic_block = 0; \
+		end_seq = 0; prologue_end = 0; epilogue_begin = 0; \
+	} while (0)
+#define ROW() do { \
+		const char *fn = NULL; \
+		size_t fi = (size_t)file; \
+		if (fi < nfiles) fn = files[fi].name; \
+		printf("  row file=%s line=", fn ? fn : "?"); \
+		if (end_seq) printf("-"); else printf("%" PRIu64, line); \
+		printf(" addr=0x%" PRIx64 " col=%" PRIu64 " stmt=%d%s%s%s\n", \
+		       addr, col, is_stmt, \
+		       basic_block ? " basic_block" : "", \
+		       prologue_end ? " prologue_end" : "", \
+		       end_seq ? " end_sequence" : ""); \
+	} while (0)
+
+	/* Address advance for VLIW targets: the operation advance is divided by
+	 * max_ops to get whole instruction-bundle steps. On x86-64 max_ops is 1
+	 * and this degenerates to addr += min_inst * advance. */
+#define ADVANCE(opadv) do { \
+		uint64_t _oa = (opadv); \
+		addr += (uint64_t)min_inst * ((op_index + _oa) / max_ops); \
+		op_index = (op_index + _oa) % max_ops; \
+	} while (0)
+
+	while (r->pos < unit_end) {
+		uint8_t op = rd_u8(r);
+		if (r->err)
+			break;
+		if (op >= opcode_base) {
+			/* Special opcode: one byte encodes both an address and a line
+			 * advance, and emits a row. This is where the compression in
+			 * the line table comes from. */
+			unsigned adj = op - opcode_base;
+			ADVANCE(adj / line_range);
+			line += line_base + (int64_t)(adj % line_range);
+			ROW();
+			basic_block = prologue_end = epilogue_begin = 0;
+			disc = 0;
+			continue;
+		}
+		if (op == 0) {
+			/* Extended opcode: length-prefixed, so unknown ones are
+			 * skippable - which is exactly why the length is there. */
+			uint64_t elen = rd_uleb(r);
+			if (r->err || elen == 0 || elen > unit_end - r->pos)
+				break;
+			size_t eend = r->pos + (size_t)elen;
+			uint8_t sub = rd_u8(r);
+			switch (sub) {
+			case 1:	/* DW_LNE_end_sequence */
+				end_seq = 1;
+				ROW();
+				LINE_RESET();
+				break;
+			case 2:	/* DW_LNE_set_address */
+				addr = rd_fixed(r, cu.addr_size);
+				op_index = 0;
+				break;
+			case 3:	/* DW_LNE_define_file (DWARF<=4) */
+				if (ver <= 4) {
+					Val v;
+					if (read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
+						FileEnt f = { v.str, rd_uleb(r) };
+						(void)rd_uleb(r);
+						(void)rd_uleb(r);
+						fv_push(&files, &nfiles, &cfiles, f);
+					}
+				}
+				break;
+			case 4:	/* DW_LNE_set_discriminator */
+				disc = rd_uleb(r);
+				break;
+			default:
+				if (verbose)
+					printf("  (unknown extended opcode %u, %" PRIu64
+					       " bytes, skipped)\n", sub, elen);
+				break;
+			}
+			if (eend > unit_end)
+				break;
+			r->pos = eend;	/* trust the length, not our own decoding */
+			continue;
+		}
+		switch (op) {
+		case 1:	/* DW_LNS_copy */
+			ROW();
+			disc = 0;
+			basic_block = prologue_end = epilogue_begin = 0;
+			break;
+		case 2:	/* DW_LNS_advance_pc */
+			ADVANCE(rd_uleb(r));
+			break;
+		case 3:	/* DW_LNS_advance_line */
+			line = (uint64_t)((int64_t)line + rd_sleb(r));
+			break;
+		case 4: file = rd_uleb(r); break;	/* DW_LNS_set_file */
+		case 5: col = rd_uleb(r); break;	/* DW_LNS_set_column */
+		case 6: is_stmt = !is_stmt; break;	/* DW_LNS_negate_stmt */
+		case 7: basic_block = 1; break;
+		case 8:	/* DW_LNS_const_add_pc: advance as special opcode 255 */
+			ADVANCE((255u - opcode_base) / line_range);
+			break;
+		case 9:	/* DW_LNS_fixed_advance_pc: uhalf, not LEB, and not scaled */
+			addr += rd_u16(r);
+			op_index = 0;
+			break;
+		case 10: prologue_end = 1; break;
+		case 11: epilogue_begin = 1; break;
+		case 12: isa = rd_uleb(r); break;
+		default:
+			/* A vendor standard opcode below opcode_base: the header told
+			 * us how many LEB operands it takes, so we can skip it. */
+			for (unsigned i = 0; i < std_len[op]; i++)
+				(void)rd_uleb(r);
+			break;
+		}
+		if (r->err)
+			break;
+	}
+	(void)isa;
+	(void)disc;
+	(void)epilogue_begin;
+	if (r->err) {
+		fprintf(stderr, "dbginfo: line unit @0x%" PRIx64
+		        ": truncated line program\n", unit_off);
+		rc = 0;
+	}
+out:
+	free(dirs);
+	free(files);
+	if (rc)
+		r->pos = unit_end;
+	return rc;
+#undef ROW
+#undef LINE_RESET
+#undef ADVANCE
+}
+
+static int dump_line(Elf *e, int verbose)
+{
+	if (!e->line)
+		die("no .debug_line section");
+	printf("== .debug_line (%zu bytes) ==\n", e->line->size);
+	Rd r = rd_at(e->line->data, e->line->size, 0);
+	while (r.pos + 4 <= e->line->size) {
+		uint64_t off = r.pos;
+		if (!dump_line_prog(e, &r, off, verbose))
+			return 0;
+		if (r.pos <= off) {
+			fprintf(stderr, "dbginfo: line unit @0x%" PRIx64
+			        " made no progress\n", off);
+			return 0;
+		}
+	}
+	return 1;
+}
+
 static int dump_sections(Elf *e)
 {
 	printf("== sections (%zu) ==\n", e->nsec);
@@ -1228,27 +1547,33 @@ static int dump_sections(Elf *e)
 
 static void usage(FILE *f)
 {
-	fputs("usage: dbginfo [--sections] [--abbrev] [--info] [--all] FILE\n"
+	fputs("usage: dbginfo [--sections] [--abbrev] [--info] [--line]\n"
+	      "                 [--line-headers] [--all] FILE\n"
 	      "\n"
 	      "  --sections      ELF section header table\n"
 	      "  --abbrev        .debug_abbrev abbreviation tables\n"
 	      "  --info          .debug_info CU headers and DIE tree\n"
-	      "  --all           --sections --abbrev --info\n"
+	      "  --line          .debug_line decoded line table rows\n"
+	      "  --line-headers  --line plus directory and file tables\n"
+	      "  --all           --sections --abbrev --info --line-headers\n"
 	      "\n"
 	      "default is --info. DWARF 2-5, 64-bit little-endian ELF.\n", f);
 }
 
 int main(int argc, char **argv)
 {
-	int want_sec = 0, want_abbrev = 0, want_info = 0;
+	int want_sec = 0, want_abbrev = 0, want_info = 0, want_line = 0,
+	    line_verbose = 0;
 	const char *path = NULL;
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		if (strcmp(a, "--sections") == 0) want_sec = 1;
 		else if (strcmp(a, "--abbrev") == 0) want_abbrev = 1;
 		else if (strcmp(a, "--info") == 0) want_info = 1;
+		else if (strcmp(a, "--line") == 0) want_line = 1;
+		else if (strcmp(a, "--line-headers") == 0) want_line = line_verbose = 1;
 		else if (strcmp(a, "--all") == 0)
-			want_sec = want_abbrev = want_info = 1;
+			want_sec = want_abbrev = want_info = want_line = line_verbose = 1;
 		else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
 			usage(stdout);
 			return 0;
@@ -1267,7 +1592,7 @@ int main(int argc, char **argv)
 		usage(stderr);
 		return 2;
 	}
-	if (!want_sec && !want_abbrev && !want_info)
+	if (!want_sec && !want_abbrev && !want_info && !want_line)
 		want_info = 1;
 
 	Elf e;
@@ -1276,6 +1601,7 @@ int main(int argc, char **argv)
 	if (want_sec) ok &= dump_sections(&e);
 	if (want_abbrev) ok &= dump_abbrev(&e);
 	if (want_info) ok &= dump_info(&e);
+	if (want_line) ok &= dump_line(&e, line_verbose);
 	/* Free so ASan's leak checker can police the parse paths. */
 	free(e.sec);
 	free(e.file);
