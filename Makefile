@@ -1,5 +1,5 @@
 CC      ?= gcc
-CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wshadow -Wpedantic
+CFLAGS  ?= -std=c11 -O2 -g -Wall -Wextra -Wshadow -Wpedantic -ffile-prefix-map=$(CURDIR)=.
 # Input is untrusted binary data, so the sanitiser build is a first-class
 # target, not an afterthought: ASan catches the out-of-bounds read a missing
 # length check would otherwise hide, UBSan catches the shift/overflow paths in
