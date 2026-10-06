@@ -1,0 +1,4 @@
+dbginfo
+dbginfo-asan
+*.o
+*.bin
