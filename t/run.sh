@@ -7,6 +7,8 @@
 #   die_names  - the multiset of (DW_TAG_*, DW_AT_name) over the whole DIE tree
 #   line_rows  - the multiset of (file, line, address) from the line program
 #   line_stmt  - the is_stmt flag per row (end_sequence rows excluded, see below)
+# Then a robustness sweep: truncations, byte corruption, and non-ELF input must
+# exit cleanly rather than crash, hang, or read out of bounds.
 set -u
 
 here=$(cd "$(dirname "$0")" && pwd)
@@ -252,6 +254,198 @@ for b in $bins; do
 	pass=$((pass + $(printf '%s\n' "$out" | grep -c '^ok  ')))
 	fail=$((fail + $(printf '%s\n' "$out" | grep -c '^FAIL')))
 done
+
+# ------------------------------------------------------- robustness sweep
+# Truncation is the cheapest fuzzer there is and it hits every length field in
+# the format. A clean run means: exit status 0 or 1 (our own diagnostics), no
+# signal (>=128 would be SIGSEGV/SIGABRT), and no timeout (124 would mean we
+# found a loop that does not advance).
+echo "--- robustness: truncation / corruption / non-ELF"
+victim="$work/g5"
+[ -f "$victim" ] || victim="$work/tiny"
+size=$(wc -c < "$victim")
+crashes=0
+tried=0
+errored=0
+step=$(( size / 200 ))
+[ "$step" -lt 1 ] && step=1
+n=1
+while [ "$n" -lt "$size" ]; do
+	head -c "$n" "$victim" > "$work/trunc.bin"
+	for flag in --info --line-headers --abbrev --all; do
+		tried=$((tried+1))
+		timeout 10 "$DD" $flag "$work/trunc.bin" >/dev/null 2>&1
+		rc=$?
+		[ "$rc" -eq 1 ] && errored=$((errored+1))
+		if [ "$rc" -gt 1 ]; then
+			crashes=$((crashes+1))
+			[ "$crashes" -le 5 ] && \
+			  echo "       trunc $n bytes $flag -> exit $rc"
+		fi
+	done
+	n=$((n + step))
+done
+if [ "$crashes" -ne 0 ]; then
+	bad "truncation sweep: $crashes of $tried runs crashed or hung"
+elif [ "$errored" -eq 0 ]; then
+	# A sweep where nothing is rejected is a sweep that proves nothing.
+	bad "truncation sweep: no prefix was rejected; the sweep is vacuous"
+else
+	ok "truncation sweep ($tried runs over $((size / step + 1)) prefixes, \
+$errored rejected, 0 crashed or hung)"
+fi
+
+# Byte corruption. Random file offsets mostly land in machine code the parser
+# never reads, so the offsets come from inside the DWARF sections themselves:
+# that reliably produces absurd unit lengths, undeclared abbrev codes, bogus
+# string offsets and nonsense line opcodes.
+offs=$(python3 - "$victim" <<'PY'
+import re, subprocess, sys
+out = subprocess.run(["readelf", "-S", "-W", sys.argv[1]],
+                     capture_output=True, text=True).stdout
+res = []
+for name, _addr, off, size in re.findall(
+        r"\[\s*\d+\]\s+(\.debug_\w+)\s+\S+\s+([0-9a-f]+)\s+([0-9a-f]+)\s+([0-9a-f]+)",
+        out):
+    o, n = int(off, 16), int(size, 16)
+    if n:
+        res += [o + (i * 7919) % n for i in range(70)]
+print(" ".join(str(x) for x in res))
+PY
+)
+corrupt=0
+ctried=0
+cerr=0
+for off in $offs; do
+	python3 -c '
+import sys
+d = bytearray(open(sys.argv[1], "rb").read())
+o = int(sys.argv[2])
+for k in range(o, min(o + 3, len(d))):
+    d[k] = 0xff
+open(sys.argv[3], "wb").write(d)' "$victim" "$off" "$work/corrupt.bin"
+	for flag in --info --all; do
+		ctried=$((ctried+1))
+		timeout 10 "$DD" $flag "$work/corrupt.bin" >/dev/null 2>&1
+		rc=$?
+		[ "$rc" -eq 1 ] && cerr=$((cerr+1))
+		if [ "$rc" -gt 1 ]; then
+			corrupt=$((corrupt+1))
+			[ "$corrupt" -le 5 ] && echo "       corrupt @$off $flag -> exit $rc"
+		fi
+	done
+done
+if [ "$ctried" -eq 0 ]; then
+	bad "corruption sweep produced no mutants (readelf -S parse failed?)"
+elif [ "$corrupt" -eq 0 ] && [ "$cerr" -eq 0 ]; then
+	bad "corruption sweep: no mutant was rejected; the sweep is vacuous"
+elif [ "$corrupt" -eq 0 ]; then
+	ok "corruption sweep ($ctried runs inside .debug_* sections, \
+$cerr rejected, 0 crashed or hung)"
+else
+	bad "corruption sweep: $corrupt of $ctried runs crashed or hung"
+fi
+
+# Truncating the whole file never reaches the DWARF decoders, because the
+# section header table lives at EOF and every prefix dies in the ELF layer
+# first. To actually exercise "unit length runs past the end of the section",
+# "truncated DIE" and "truncated line program", shrink sh_size in place and
+# leave the rest of the file intact.
+cat > "$work/shrink.py" <<'PY'
+import struct, sys
+# argv: FILE SECTION (size | NEWSIZE OUT). "size" just reports sh_size, so the
+# shell does not have to parse readelf -S (whose field layout shifts with the
+# section index width, and whose hex sizes mawk cannot convert).
+path, want = sys.argv[1], sys.argv[2]
+report = sys.argv[3] == "size"
+newsize = 0 if report else int(sys.argv[3])
+out = None if report else sys.argv[4]
+d = bytearray(open(path, "rb").read())
+shoff, = struct.unpack_from("<Q", d, 0x28)
+shentsize, shnum, shstrndx = struct.unpack_from("<HHH", d, 0x3a)
+def shdr(i):
+    return struct.unpack_from("<IIQQQQ", d, shoff + i * shentsize)
+stroff = shdr(shstrndx)[4]
+for i in range(shnum):
+    nameoff, _t, _f, _a, off, size = shdr(i)
+    end = d.index(b"\0", stroff + nameoff)
+    if d[stroff + nameoff:end].decode() == want:
+        if report:
+            print(size)
+        else:
+            struct.pack_into("<Q", d, shoff + i * shentsize + 0x20, newsize)  # sh_size
+            open(out, "wb").write(d)
+        sys.exit(0)
+sys.exit(2)   # section absent: caller skips
+PY
+secs=0
+serr=0
+scrash=0
+stried=0
+for sec in .debug_info .debug_abbrev .debug_line .debug_str .debug_line_str; do
+	orig=$(python3 "$work/shrink.py" "$victim" "$sec" size) || continue
+	[ -n "$orig" ] && [ "$orig" -gt 0 ] || continue
+	secs=$((secs+1))
+	k=0
+	while [ "$k" -le 40 ]; do
+		ns=$(( orig * k / 40 ))
+		python3 "$work/shrink.py" "$victim" "$sec" "$ns" "$work/shrunk.bin" || break
+		for flag in --info --all; do
+			stried=$((stried+1))
+			timeout 10 "$DD" $flag "$work/shrunk.bin" >/dev/null 2>&1
+			rc=$?
+			[ "$rc" -eq 1 ] && serr=$((serr+1))
+			if [ "$rc" -gt 1 ]; then
+				scrash=$((scrash+1))
+				[ "$scrash" -le 5 ] && \
+				  echo "       $sec shrunk to $ns $flag -> exit $rc"
+			fi
+		done
+		k=$((k+1))
+	done
+done
+if [ "$stried" -eq 0 ]; then
+	bad "section-shrink sweep found no .debug_* sections to shrink"
+elif [ "$scrash" -ne 0 ]; then
+	bad "section-shrink sweep: $scrash of $stried runs crashed or hung"
+elif [ "$serr" -eq 0 ]; then
+	bad "section-shrink sweep: nothing was rejected; the sweep is vacuous"
+else
+	ok "section-shrink sweep ($stried runs over $secs sections, \
+$serr rejected, 0 crashed or hung)"
+fi
+
+# Garbage that is not an ELF file at all, plus an ELF with no debug info.
+: > "$work/empty"
+printf 'not an elf, just text\n' > "$work/text"
+head -c 4096 /dev/urandom > "$work/random"
+printf '\177ELF\002\001\001' > "$work/stub"
+gcc -x c -o "$work/nodebug" - <<'EOF' 2>/dev/null
+int main(void) { return 0; }
+EOF
+junk_ok=1
+for j in empty text random stub nodebug; do
+	[ -f "$work/$j" ] || continue
+	timeout 10 "$DD" --all "$work/$j" >/dev/null 2>&1
+	rc=$?
+	if [ "$rc" -gt 1 ]; then
+		echo "       $j -> exit $rc"
+		junk_ok=0
+	fi
+done
+timeout 10 "$DD" --all "$work/does-not-exist" >/dev/null 2>&1
+[ $? -eq 1 ] || junk_ok=0
+if [ "$junk_ok" -eq 1 ]; then
+	ok "non-ELF and missing-debug-info inputs error cleanly"
+else
+	bad "non-ELF input did not error cleanly"
+fi
+
+# A directory and /dev/zero-ish input: no reason to crash on either.
+timeout 10 "$DD" --info "$root" >/dev/null 2>&1
+rc=$?
+if [ "$rc" -le 1 ]; then ok "directory argument errors cleanly"
+else bad "directory argument -> exit $rc"; fi
 
 echo
 echo "$pass passed, $fail failed"
