@@ -1218,6 +1218,12 @@ static int dump_abbrev(Elf *e)
 /* .debug_line                                                        */
 /* ------------------------------------------------------------------ */
 
+#define DW_LNCT_path 1
+#define DW_LNCT_directory_index 2
+#define DW_LNCT_timestamp 3
+#define DW_LNCT_size 4
+#define DW_LNCT_MD5 5
+
 typedef struct {
 	const char *name;
 	uint64_t dir;
@@ -1233,6 +1239,14 @@ static void fv_push(FileEnt **v, size_t *n, size_t *cap, FileEnt f)
 		*v = nv;
 	}
 	(*v)[(*n)++] = f;
+}
+
+/* Read one entry value from a DWARF5 directory/file table using the
+ * format description. Only the forms the spec permits here are meaningful;
+ * anything else we still have to skip by length, which read_form does. */
+static int line_entry_val(Rd *r, Elf *e, const Cu *cu, uint64_t form, Val *v)
+{
+	return read_form(r, e, cu, form, 0, v);
 }
 
 static int dump_line_prog(Elf *e, Rd *r, uint64_t unit_off, int verbose)
@@ -1262,17 +1276,17 @@ static int dump_line_prog(Elf *e, Rd *r, uint64_t unit_off, int verbose)
 	uint64_t ver = rd_u16(r);
 	if (r->err)
 		return 0;
-	/* shortcut: DWARF 5 reshuffled this header (it gained address_size and
-	 * segment_selector_size) and replaced both string lists with
-	 * format-described entry tables. Refuse it for now rather than
-	 * misreading it; upgrade path is a second header branch below. */
-	if (ver < 2 || ver > 4) {
+	if (ver < 2 || ver > 5) {
 		fprintf(stderr, "dbginfo: line unit @0x%" PRIx64 ": version %"
-		        PRIu64 " not supported (we handle 2-4)\n", unit_off, ver);
+		        PRIu64 " not supported (we handle 2-5)\n", unit_off, ver);
 		return 0;
 	}
 	cu.version = ver;
 	unsigned seg_sel = 0;
+	if (ver >= 5) {
+		cu.addr_size = rd_u8(r);
+		seg_sel = rd_u8(r);
+	}
 	uint64_t hlen = rd_fixed(r, cu.off_size);
 	size_t prog_start = r->pos + (size_t)hlen;	/* header_length is from here */
 	unsigned min_inst = rd_u8(r);
@@ -1309,42 +1323,108 @@ static int dump_line_prog(Elf *e, Rd *r, uint64_t unit_off, int verbose)
 	FileEnt *files = NULL;
 	size_t nfiles = 0, cfiles = 0;
 	int rc = 1;
+	/* DWARF5 numbers files from 0 and entry 0 is the primary source file;
+	 * DWARF2-4 number from 1 with entry 0 meaning "the CU's own name".
+	 * The state machine's initial `file` register is 1 in both, which is
+	 * why the off-by-one here is the classic place to get this wrong. */
 
-	/* DWARF2-4: two NUL-terminated-string lists, each ended by an
-	 * empty string. */
-	for (;;) {
-		Val v;
-		if (!read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
-			rc = 0;
-			goto out;
+	if (ver >= 5) {
+		unsigned dfc = rd_u8(r);
+		uint64_t *dforms = xmalloc((dfc ? dfc : 1) * 2 * sizeof(uint64_t));
+		for (unsigned i = 0; i < dfc; i++) {
+			dforms[2 * i] = rd_uleb(r);
+			dforms[2 * i + 1] = rd_uleb(r);
 		}
-		if (!v.str || !*v.str)
-			break;
-		if (ndirs == cdirs) {
-			cdirs = cdirs ? cdirs * 2 : 8;
-			char **nv = realloc(dirs, cdirs * sizeof *nv);
-			if (!nv) die("out of memory");
-			dirs = nv;
+		uint64_t dcount = rd_uleb(r);
+		if (r->err || dcount > unit_end) { free(dforms); rc = 0; goto out; }
+		for (uint64_t i = 0; i < dcount && rc; i++) {
+			const char *nm = NULL;
+			for (unsigned j = 0; j < dfc; j++) {
+				Val v;
+				if (!line_entry_val(r, e, &cu, dforms[2 * j + 1], &v)) {
+					rc = 0;
+					break;
+				}
+				if (dforms[2 * j] == DW_LNCT_path && v.kind == V_STR)
+					nm = v.str;
+			}
+			if (!rc)
+				break;
+			if (ndirs == cdirs) {
+				cdirs = cdirs ? cdirs * 2 : 8;
+				char **nv = realloc(dirs, cdirs * sizeof *nv);
+				if (!nv) die("out of memory");
+				dirs = nv;
+			}
+			dirs[ndirs++] = (char *)(uintptr_t)nm;
 		}
-		dirs[ndirs++] = (char *)(uintptr_t)v.str;
-	}
-	fv_push(&files, &nfiles, &cfiles, (FileEnt){ NULL, 0 });	/* index 0 */
-	for (;;) {
-		Val v;
-		if (!read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
-			rc = 0;
-			goto out;
+		free(dforms);
+		if (!rc) goto out;
+
+		unsigned ffc = rd_u8(r);
+		uint64_t *fforms = xmalloc((ffc ? ffc : 1) * 2 * sizeof(uint64_t));
+		for (unsigned i = 0; i < ffc; i++) {
+			fforms[2 * i] = rd_uleb(r);
+			fforms[2 * i + 1] = rd_uleb(r);
 		}
-		if (!v.str || !*v.str)
-			break;
-		FileEnt f = { v.str, rd_uleb(r) };
-		(void)rd_uleb(r);	/* mtime */
-		(void)rd_uleb(r);	/* length */
-		if (r->err) {
-			rc = 0;
-			goto out;
+		uint64_t fcount = rd_uleb(r);
+		if (r->err || fcount > unit_end) { free(fforms); rc = 0; goto out; }
+		for (uint64_t i = 0; i < fcount && rc; i++) {
+			FileEnt f = { NULL, 0 };
+			for (unsigned j = 0; j < ffc; j++) {
+				Val v;
+				if (!line_entry_val(r, e, &cu, fforms[2 * j + 1], &v)) {
+					rc = 0;
+					break;
+				}
+				if (fforms[2 * j] == DW_LNCT_path && v.kind == V_STR)
+					f.name = v.str;
+				else if (fforms[2 * j] == DW_LNCT_directory_index)
+					f.dir = v.u;
+			}
+			if (!rc)
+				break;
+			fv_push(&files, &nfiles, &cfiles, f);
 		}
-		fv_push(&files, &nfiles, &cfiles, f);
+		free(fforms);
+		if (!rc) goto out;
+	} else {
+		/* DWARF2-4: two NUL-terminated-string lists, each ended by an
+		 * empty string. */
+		for (;;) {
+			Val v;
+			if (!read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
+				rc = 0;
+				goto out;
+			}
+			if (!v.str || !*v.str)
+				break;
+			if (ndirs == cdirs) {
+				cdirs = cdirs ? cdirs * 2 : 8;
+				char **nv = realloc(dirs, cdirs * sizeof *nv);
+				if (!nv) die("out of memory");
+				dirs = nv;
+			}
+			dirs[ndirs++] = (char *)(uintptr_t)v.str;
+		}
+		fv_push(&files, &nfiles, &cfiles, (FileEnt){ NULL, 0 });	/* index 0 */
+		for (;;) {
+			Val v;
+			if (!read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
+				rc = 0;
+				goto out;
+			}
+			if (!v.str || !*v.str)
+				break;
+			FileEnt f = { v.str, rd_uleb(r) };
+			(void)rd_uleb(r);	/* mtime */
+			(void)rd_uleb(r);	/* length */
+			if (r->err) {
+				rc = 0;
+				goto out;
+			}
+			fv_push(&files, &nfiles, &cfiles, f);
+		}
 	}
 
 	if (verbose) {
