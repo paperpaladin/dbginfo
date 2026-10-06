@@ -1175,6 +1175,7 @@ static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
 	 * C stack here. */
 	int depth = 0;
 	int rc = 1;
+	int first_die = 1;
 	while (r->pos < cu_end) {
 		uint64_t die_off = r->pos;
 		uint64_t code = rd_uleb(r);
@@ -1197,6 +1198,29 @@ static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
 			        cu_off, die_off, code);
 			rc = 0;
 			break;
+		}
+		if (first_die) {
+			first_die = 0;
+			/* DW_AT_str_offsets_base and DW_AT_addr_base live on the root
+			 * DIE, but nothing requires them to come first: clang emits
+			 * DW_AT_name as DW_FORM_strx1 *before* declaring the base, so a
+			 * single forward pass resolves the second CU's strings against
+			 * CU 1's base. readelf caught us doing exactly that. So scan the
+			 * root DIE's attributes once for the bases, then rewind and
+			 * decode for real. read_form only reads, so the dry pass is
+			 * free of side effects. */
+			Rd pre = *r;
+			Cu tmp = cu;
+			for (size_t i = 0; i < a->nattr; i++) {
+				Val v;
+				if (!read_form(&pre, e, &tmp, a->attr[i].form,
+				               a->attr[i].iconst, &v, 0))
+					break;	/* malformed; the real pass will report it */
+				if (a->attr[i].at == DW_AT_str_offsets_base)
+					cu.str_off_base = v.u;
+				else if (a->attr[i].at == DW_AT_addr_base)
+					cu.addr_base = v.u;
+			}
 		}
 		char tb[64];
 		printf("<%d><0x%" PRIx64 "> %s (abbrev %" PRIu64 ")%s\n", depth,
