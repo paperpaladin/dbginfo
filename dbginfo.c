@@ -974,6 +974,19 @@ static void print_val(const Val *v, uint64_t at)
 /* .debug_info                                                        */
 /* ------------------------------------------------------------------ */
 
+static const char *ut_name(uint64_t ut)
+{
+	switch (ut) {
+	case 1: return "DW_UT_compile";
+	case 2: return "DW_UT_type";
+	case 3: return "DW_UT_partial";
+	case 4: return "DW_UT_skeleton";
+	case 5: return "DW_UT_split_compile";
+	case 6: return "DW_UT_split_type";
+	default: return "DW_UT_unknown";
+	}
+}
+
 /* Returns 0 on a parse error (message already printed). */
 static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
 {
@@ -984,12 +997,12 @@ static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
 	uint64_t len = rd_u32(r);
 	if (r->err)
 		return 0;
-	/* 0xfffffff0..0xffffffff are reserved. shortcut: 0xffffffff selects
-	 * 64-bit DWARF, where the length and every section offset widen to 8
-	 * bytes; refuse it rather than misread it. Upgrade path is to set
-	 * cu.off_size = 8 here, since every offset read already goes through
-	 * rd_fixed(cu.off_size). */
-	if (len >= 0xfffffff0u) {
+	/* 0xfffffff0..0xffffffff are reserved; 0xffffffff selects 64-bit DWARF
+	 * where the real length and all section offsets become 8 bytes. */
+	if (len == 0xffffffffu) {
+		cu.off_size = 8;
+		len = rd_u64(r);
+	} else if (len >= 0xfffffff0u) {
 		fprintf(stderr, "dbginfo: CU @0x%" PRIx64
 		        ": reserved length 0x%" PRIx64 "\n", cu_off, len);
 		return 0;
@@ -1005,17 +1018,25 @@ static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
 	size_t cu_end = body + (size_t)len;
 
 	cu.version = rd_u16(r);
-	uint64_t abbrev_off = 0;
-	/* shortcut: DWARF 5 reordered this header and added a unit_type byte, so
-	 * reading it with the DWARF 2-4 layout would silently mistake the unit
-	 * type for half the abbrev offset. Refuse it until the branch exists. */
-	if (cu.version >= 2 && cu.version <= 4) {
+	uint64_t ut = 1, abbrev_off = 0;
+	if (cu.version >= 5) {
+		/* DWARF5 reordered the header and added unit_type. */
+		ut = rd_u8(r);
+		cu.addr_size = rd_u8(r);
+		abbrev_off = rd_fixed(r, cu.off_size);
+		if (ut == 2 || ut == 6) {	/* type units carry a signature */
+			(void)rd_u64(r);
+			(void)rd_fixed(r, cu.off_size);
+		} else if (ut == 4 || ut == 5) {	/* split units carry a dwo_id */
+			(void)rd_u64(r);
+		}
+	} else if (cu.version >= 2) {
 		abbrev_off = rd_fixed(r, cu.off_size);
 		cu.addr_size = rd_u8(r);
 	} else {
 		fprintf(stderr, "dbginfo: CU @0x%" PRIx64
 		        ": DWARF version %" PRIu64 " not supported "
-		        "(we handle 2-4)\n", cu_off, cu.version);
+		        "(we handle 2-5)\n", cu_off, cu.version);
 		r->pos = cu_end;
 		*bad = 1;
 		return 1;
@@ -1029,8 +1050,10 @@ static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
 	}
 
 	printf("CU @0x%" PRIx64 " len=0x%" PRIx64 " version=%" PRIu64
-	       " abbrev_off=0x%" PRIx64 " addr_size=%u\n",
-	       cu_off, len, cu.version, abbrev_off, cu.addr_size);
+	       " unit_type=%s abbrev_off=0x%" PRIx64 " addr_size=%u"
+	       " dwarf%u\n", cu_off, len, cu.version,
+	       cu.version >= 5 ? ut_name(ut) : "DW_UT_compile",
+	       abbrev_off, cu.addr_size, cu.off_size == 8 ? 64 : 32);
 
 	AbbrevTab tab = { 0 };
 	if (!abbrev_parse(&tab, e->abbrev, abbrev_off)) {
@@ -1212,7 +1235,7 @@ static void usage(FILE *f)
 	      "  --info          .debug_info CU headers and DIE tree\n"
 	      "  --all           --sections --abbrev --info\n"
 	      "\n"
-	      "default is --info. DWARF 2-4, 64-bit little-endian ELF.\n", f);
+	      "default is --info. DWARF 2-5, 64-bit little-endian ELF.\n", f);
 }
 
 int main(int argc, char **argv)
