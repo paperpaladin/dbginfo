@@ -812,7 +812,7 @@ typedef struct {
 	uint64_t cu_off;	/* .debug_info offset of this CU header */
 } Cu;
 
-enum { V_NONE, V_U, V_S, V_STR, V_UNRES };
+enum { V_NONE, V_U, V_S, V_STR, V_REF, V_UNRES };
 
 typedef struct {
 	int kind;
@@ -846,6 +846,7 @@ static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
 		v->kind = V_U;
 		v->u = rd_fixed(r, cu->off_size);
 		break;
+	case DW_FORM_ref_sig8: v->kind = V_U; v->u = rd_u64(r); break;
 	case DW_FORM_string: {
 		/* Inline NUL-terminated string living in .debug_info itself. */
 		size_t start = r->pos;
@@ -878,6 +879,19 @@ static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
 		                     : "no .debug_line_str";
 		break;
 	}
+	case DW_FORM_ref1: v->kind = V_REF; v->u = cu->cu_off + rd_u8(r); break;
+	case DW_FORM_ref2: v->kind = V_REF; v->u = cu->cu_off + rd_u16(r); break;
+	case DW_FORM_ref4: v->kind = V_REF; v->u = cu->cu_off + rd_u32(r); break;
+	case DW_FORM_ref8: v->kind = V_REF; v->u = cu->cu_off + rd_u64(r); break;
+	case DW_FORM_ref_udata:
+		v->kind = V_REF;
+		v->u = cu->cu_off + rd_uleb(r);
+		break;
+	case DW_FORM_ref_addr:
+		/* Section-relative, not CU-relative. */
+		v->kind = V_REF;
+		v->u = rd_fixed(r, cu->off_size);
+		break;
 	default:
 		/* Unknown form: we cannot know its length, so the rest of this CU
 		 * is unparseable. Say so loudly instead of guessing. */
@@ -891,6 +905,9 @@ static void print_val(const Val *v, uint64_t at)
 	switch (v->kind) {
 	case V_STR:
 		printf("\"%s\"", v->str);
+		break;
+	case V_REF:
+		printf("<0x%" PRIx64 ">", v->u);
 		break;
 	case V_S:
 		printf("%" PRId64, v->s);
