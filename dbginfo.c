@@ -724,6 +724,18 @@ static void abbrev_free(AbbrevTab *t)
 	t->n = t->cap = 0;
 }
 
+/* Abbreviation codes are ULEB128 and in practice dense from 1, but the spec
+ * does not require that, so lookup is a linear scan rather than an index.
+ * With the handful of abbrevs a real CU declares this is faster than a hash
+ * and immune to a hostile table that claims code 2^60. */
+static const Abbrev *abbrev_find(const AbbrevTab *t, uint64_t code)
+{
+	for (size_t i = 0; i < t->n; i++)
+		if (t->v[i].code == code)
+			return &t->v[i];
+	return NULL;
+}
+
 /* One table runs from `off` to the first abbreviation with code 0; each
  * declaration ends with an all-zero (attribute, form) pair. */
 static int abbrev_parse(AbbrevTab *t, const Sec *sec, uint64_t off)
@@ -787,6 +799,244 @@ static int abbrev_parse(AbbrevTab *t, const Sec *sec, uint64_t off)
 		}
 		t->n++;		/* only count it once fully parsed */
 	}
+}
+
+/* ------------------------------------------------------------------ */
+/* attribute values                                                   */
+/* ------------------------------------------------------------------ */
+
+typedef struct {
+	uint64_t version;
+	unsigned addr_size;
+	unsigned off_size;	/* 4 for 32-bit DWARF, 8 for 64-bit DWARF */
+	uint64_t cu_off;	/* .debug_info offset of this CU header */
+} Cu;
+
+enum { V_NONE, V_U, V_S, V_UNRES };
+
+typedef struct {
+	int kind;
+	uint64_t form;
+	uint64_t u;
+	int64_t s;
+	const char *why;	/* set when kind == V_UNRES */
+} Val;
+
+static int read_form(Rd *r, const Cu *cu, uint64_t form, int64_t ic, Val *v)
+{
+	memset(v, 0, sizeof *v);
+	v->form = form;
+	switch (form) {
+	case DW_FORM_addr:
+		v->kind = V_U;
+		v->u = rd_fixed(r, cu->addr_size);
+		break;
+	case DW_FORM_data1: v->kind = V_U; v->u = rd_u8(r); break;
+	case DW_FORM_data2: v->kind = V_U; v->u = rd_u16(r); break;
+	case DW_FORM_data4: v->kind = V_U; v->u = rd_u32(r); break;
+	case DW_FORM_data8: v->kind = V_U; v->u = rd_u64(r); break;
+	case DW_FORM_udata: v->kind = V_U; v->u = rd_uleb(r); break;
+	case DW_FORM_sdata: v->kind = V_S; v->s = rd_sleb(r); break;
+	case DW_FORM_flag: v->kind = V_U; v->u = rd_u8(r); break;
+	case DW_FORM_flag_present: v->kind = V_U; v->u = 1; break;
+	case DW_FORM_implicit_const: v->kind = V_S; v->s = ic; break;
+	case DW_FORM_sec_offset:
+		v->kind = V_U;
+		v->u = rd_fixed(r, cu->off_size);
+		break;
+	default:
+		/* Unknown form: we cannot know its length, so the rest of this CU
+		 * is unparseable. Say so loudly instead of guessing. */
+		return 0;
+	}
+	return !r->err;
+}
+
+static void print_val(const Val *v, uint64_t at)
+{
+	switch (v->kind) {
+	case V_S:
+		printf("%" PRId64, v->s);
+		break;
+	case V_UNRES: {
+		char sb[64];
+		printf("<unresolved %s 0x%" PRIx64 ": %s>",
+		       lookup(forms, sizeof forms / sizeof *forms, v->form, sb,
+		              sizeof sb, "DW_FORM"), v->u, v->why);
+		break;
+	}
+	case V_U:
+	default:
+		/* Addresses and section offsets read better in hex; counts,
+		 * line numbers and flags in decimal. */
+		if (at == DW_AT_low_pc || at == DW_AT_high_pc ||
+		    at == DW_AT_entry_pc || at == DW_AT_stmt_list ||
+		    at == DW_AT_ranges || at == DW_AT_str_offsets_base ||
+		    at == DW_AT_addr_base || at == DW_AT_rnglists_base ||
+		    at == DW_AT_loclists_base || at == DW_AT_macros ||
+		    v->form == DW_FORM_addr || v->form == DW_FORM_ref_sig8)
+			printf("0x%" PRIx64, v->u);
+		else
+			printf("%" PRIu64, v->u);
+		break;
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* .debug_info                                                        */
+/* ------------------------------------------------------------------ */
+
+/* Returns 0 on a parse error (message already printed). */
+static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
+{
+	Cu cu = { 0 };
+	cu.cu_off = cu_off;
+	cu.off_size = 4;
+
+	uint64_t len = rd_u32(r);
+	if (r->err)
+		return 0;
+	/* 0xfffffff0..0xffffffff are reserved. shortcut: 0xffffffff selects
+	 * 64-bit DWARF, where the length and every section offset widen to 8
+	 * bytes; refuse it rather than misread it. Upgrade path is to set
+	 * cu.off_size = 8 here, since every offset read already goes through
+	 * rd_fixed(cu.off_size). */
+	if (len >= 0xfffffff0u) {
+		fprintf(stderr, "dbginfo: CU @0x%" PRIx64
+		        ": reserved length 0x%" PRIx64 "\n", cu_off, len);
+		return 0;
+	}
+	if (r->err)
+		return 0;
+	size_t body = r->pos;
+	if (len > r->len - body) {
+		fprintf(stderr, "dbginfo: CU @0x%" PRIx64 ": length 0x%" PRIx64
+		        " runs past end of .debug_info\n", cu_off, len);
+		return 0;
+	}
+	size_t cu_end = body + (size_t)len;
+
+	cu.version = rd_u16(r);
+	uint64_t abbrev_off = 0;
+	/* shortcut: DWARF 5 reordered this header and added a unit_type byte, so
+	 * reading it with the DWARF 2-4 layout would silently mistake the unit
+	 * type for half the abbrev offset. Refuse it until the branch exists. */
+	if (cu.version >= 2 && cu.version <= 4) {
+		abbrev_off = rd_fixed(r, cu.off_size);
+		cu.addr_size = rd_u8(r);
+	} else {
+		fprintf(stderr, "dbginfo: CU @0x%" PRIx64
+		        ": DWARF version %" PRIu64 " not supported "
+		        "(we handle 2-4)\n", cu_off, cu.version);
+		r->pos = cu_end;
+		*bad = 1;
+		return 1;
+	}
+	if (r->err)
+		return 0;
+	if (cu.addr_size == 0 || cu.addr_size > 8) {
+		fprintf(stderr, "dbginfo: CU @0x%" PRIx64
+		        ": implausible address size %u\n", cu_off, cu.addr_size);
+		return 0;
+	}
+
+	printf("CU @0x%" PRIx64 " len=0x%" PRIx64 " version=%" PRIu64
+	       " abbrev_off=0x%" PRIx64 " addr_size=%u\n",
+	       cu_off, len, cu.version, abbrev_off, cu.addr_size);
+
+	AbbrevTab tab = { 0 };
+	if (!abbrev_parse(&tab, e->abbrev, abbrev_off)) {
+		fprintf(stderr, "dbginfo: CU @0x%" PRIx64
+		        ": bad abbrev table at 0x%" PRIx64 "\n",
+		        cu_off, abbrev_off);
+		abbrev_free(&tab);
+		return 0;
+	}
+
+	/* The DIE tree is flattened: a DIE whose abbrev says it has children is
+	 * followed by its children, and the child list is terminated by a null
+	 * DIE (abbrev code 0). Depth is therefore derivable from the stream, no
+	 * recursion needed - which also means a hostile file cannot blow the
+	 * C stack here. */
+	int depth = 0;
+	int rc = 1;
+	while (r->pos < cu_end) {
+		uint64_t die_off = r->pos;
+		uint64_t code = rd_uleb(r);
+		if (r->err) {
+			fprintf(stderr, "dbginfo: CU @0x%" PRIx64
+			        ": truncated DIE at 0x%" PRIx64 "\n",
+			        cu_off, die_off);
+			rc = 0;
+			break;
+		}
+		if (code == 0) {
+			if (depth > 0)
+				depth--;
+			continue;
+		}
+		const Abbrev *a = abbrev_find(&tab, code);
+		if (!a) {
+			fprintf(stderr, "dbginfo: CU @0x%" PRIx64 ": DIE at 0x%"
+			        PRIx64 " uses undeclared abbrev code %" PRIu64 "\n",
+			        cu_off, die_off, code);
+			rc = 0;
+			break;
+		}
+		char tb[64];
+		printf("<%d><0x%" PRIx64 "> %s (abbrev %" PRIu64 ")%s\n", depth,
+		       die_off, lookup(tags, sizeof tags / sizeof *tags, a->tag,
+		                       tb, sizeof tb, "DW_TAG"),
+		       code, a->children ? " [children]" : "");
+		for (size_t i = 0; i < a->nattr; i++) {
+			Val v;
+			if (!read_form(r, &cu, a->attr[i].form,
+			               a->attr[i].iconst, &v)) {
+				char fb[64];
+				fprintf(stderr, "dbginfo: CU @0x%" PRIx64 ": DIE 0x%"
+				        PRIx64 ": cannot decode %s (0x%" PRIx64
+				        "); rest of CU skipped\n", cu_off, die_off,
+				        lookup(forms, sizeof forms / sizeof *forms,
+				               a->attr[i].form, fb, sizeof fb, "DW_FORM"),
+				        a->attr[i].form);
+				rc = 0;
+				goto done;
+			}
+			char ab[64];
+			printf("    %s = ",
+			       lookup(attrs, sizeof attrs / sizeof *attrs,
+			              a->attr[i].at, ab, sizeof ab, "DW_AT"));
+			print_val(&v, a->attr[i].at);
+			putchar('\n');
+		}
+		if (a->children)
+			depth++;
+	}
+done:
+	abbrev_free(&tab);
+	if (rc)
+		r->pos = cu_end;	/* trailing padding is legal */
+	return rc;
+}
+
+static int dump_info(Elf *e)
+{
+	if (!e->info)
+		die("no .debug_info section (compile with -g?)");
+	printf("== .debug_info (%zu bytes) ==\n", e->info->size);
+	Rd r = rd_at(e->info->data, e->info->size, 0);
+	int bad = 0;
+	while (r.pos + 4 <= e->info->size) {
+		uint64_t off = r.pos;
+		if (!dump_cu(e, &r, off, &bad))
+			return 0;
+		if (r.pos <= off) {	/* belt and braces against a zero-length CU */
+			fprintf(stderr, "dbginfo: CU @0x%" PRIx64
+			        " made no progress\n", off);
+			return 0;
+		}
+	}
+	return !bad;
 }
 
 static int dump_abbrev(Elf *e)
@@ -867,25 +1117,27 @@ static int dump_sections(Elf *e)
 
 static void usage(FILE *f)
 {
-	fputs("usage: dbginfo [--sections] [--abbrev] [--all] FILE\n"
+	fputs("usage: dbginfo [--sections] [--abbrev] [--info] [--all] FILE\n"
 	      "\n"
 	      "  --sections      ELF section header table\n"
 	      "  --abbrev        .debug_abbrev abbreviation tables\n"
-	      "  --all           --sections --abbrev\n"
+	      "  --info          .debug_info CU headers and DIE tree\n"
+	      "  --all           --sections --abbrev --info\n"
 	      "\n"
-	      "default is --abbrev. 64-bit little-endian ELF.\n", f);
+	      "default is --info. DWARF 2-4, 64-bit little-endian ELF.\n", f);
 }
 
 int main(int argc, char **argv)
 {
-	int want_sec = 0, want_abbrev = 0;
+	int want_sec = 0, want_abbrev = 0, want_info = 0;
 	const char *path = NULL;
 	for (int i = 1; i < argc; i++) {
 		const char *a = argv[i];
 		if (strcmp(a, "--sections") == 0) want_sec = 1;
 		else if (strcmp(a, "--abbrev") == 0) want_abbrev = 1;
+		else if (strcmp(a, "--info") == 0) want_info = 1;
 		else if (strcmp(a, "--all") == 0)
-			want_sec = want_abbrev = 1;
+			want_sec = want_abbrev = want_info = 1;
 		else if (strcmp(a, "-h") == 0 || strcmp(a, "--help") == 0) {
 			usage(stdout);
 			return 0;
@@ -904,14 +1156,15 @@ int main(int argc, char **argv)
 		usage(stderr);
 		return 2;
 	}
-	if (!want_sec && !want_abbrev)
-		want_abbrev = 1;
+	if (!want_sec && !want_abbrev && !want_info)
+		want_info = 1;
 
 	Elf e;
 	elf_load(&e, path);
 	int ok = 1;
 	if (want_sec) ok &= dump_sections(&e);
 	if (want_abbrev) ok &= dump_abbrev(&e);
+	if (want_info) ok &= dump_info(&e);
 	/* Free so ASan's leak checker can police the parse paths. */
 	free(e.sec);
 	free(e.file);
