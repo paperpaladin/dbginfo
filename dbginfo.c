@@ -505,7 +505,7 @@ typedef struct {
 	Sec *sec;
 	size_t nsec;
 	/* the sections we decode; NULL when absent */
-	const Sec *info, *abbrev, *str, *line_str, *line;
+	const Sec *info, *abbrev, *str, *line_str, *line, *str_off, *addr;
 } Elf;
 
 static void die(const char *fmt, ...)
@@ -677,6 +677,8 @@ static void elf_load(Elf *e, const char *path)
 	e->str = find_sec(e, ".debug_str");
 	e->line_str = find_sec(e, ".debug_line_str");
 	e->line = find_sec(e, ".debug_line");
+	e->str_off = find_sec(e, ".debug_str_offsets");
+	e->addr = find_sec(e, ".debug_addr");
 
 	/* shortcut: SHF_COMPRESSED / .zdebug_* sections would need zlib or
 	 * zstd, which we refuse to link. Say so instead of printing garbage.
@@ -810,6 +812,8 @@ typedef struct {
 	unsigned addr_size;
 	unsigned off_size;	/* 4 for 32-bit DWARF, 8 for 64-bit DWARF */
 	uint64_t cu_off;	/* .debug_info offset of this CU header */
+	uint64_t str_off_base;
+	uint64_t addr_base;
 } Cu;
 
 enum { V_NONE, V_U, V_S, V_STR, V_BLOCK, V_REF, V_UNRES };
@@ -825,8 +829,55 @@ typedef struct {
 	const char *why;	/* set when kind == V_UNRES */
 } Val;
 
+/* An index into .debug_str_offsets (DW_FORM_strx*) is relative to the CU's
+ * DW_AT_str_offsets_base. We default the base to 8, the size of a 32-bit
+ * DWARF5 str_offsets header, for the case where the CU declares no base.
+ * shortcut: a two-pass DIE read would get this exactly right; the default is
+ * shortcut: a CU whose root DIE declares no base at all (split DWARF skeleton
+ * units) still falls back to 8. The root DIE is prescanned for the real base
+ * before any attribute is decoded, so the fallback only bites producers that
+ * omit the attribute entirely. */
+static const char *strx_lookup(Elf *e, const Cu *cu, uint64_t idx,
+                               const char **why)
+{
+	if (!e->str_off) {
+		*why = "no .debug_str_offsets";
+		return NULL;
+	}
+	uint64_t base = cu->str_off_base ? cu->str_off_base : 8;
+	Rd r = rd_at(e->str_off->data, e->str_off->size,
+	             base + idx * cu->off_size);
+	uint64_t off = rd_fixed(&r, cu->off_size);
+	if (r.err) {
+		*why = "str_offsets index out of range";
+		return NULL;
+	}
+	const char *s = sec_str(e->str, off);
+	if (!s)
+		*why = "bad .debug_str offset";
+	return s;
+}
+
+static int addrx_lookup(Elf *e, const Cu *cu, uint64_t idx, uint64_t *out,
+                        const char **why)
+{
+	if (!e->addr) {
+		*why = "no .debug_addr";
+		return 0;
+	}
+	uint64_t base = cu->addr_base ? cu->addr_base : 8;
+	Rd r = rd_at(e->addr->data, e->addr->size, base + idx * cu->addr_size);
+	uint64_t v = rd_fixed(&r, cu->addr_size);
+	if (r.err) {
+		*why = "addr index out of range";
+		return 0;
+	}
+	*out = v;
+	return 1;
+}
+
 static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
-                     Val *v)
+                     Val *v, int depth)
 {
 	memset(v, 0, sizeof *v);
 	v->form = form;
@@ -887,6 +938,33 @@ static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
 		                     : "no .debug_line_str";
 		break;
 	}
+	case DW_FORM_strx: case DW_FORM_strx1: case DW_FORM_strx2:
+	case DW_FORM_strx3: case DW_FORM_strx4: {
+		uint64_t idx = (form == DW_FORM_strx) ? rd_uleb(r)
+		             : rd_fixed(r, (unsigned)(form - DW_FORM_strx1 + 1));
+		const char *why = "unresolved";
+		v->u = idx;
+		v->str = r->err ? NULL : strx_lookup(e, cu, idx, &why);
+		v->kind = v->str ? V_STR : V_UNRES;
+		v->why = why;
+		break;
+	}
+	case DW_FORM_addrx: case DW_FORM_addrx1: case DW_FORM_addrx2:
+	case DW_FORM_addrx3: case DW_FORM_addrx4: {
+		uint64_t idx = (form == DW_FORM_addrx) ? rd_uleb(r)
+		             : rd_fixed(r, (unsigned)(form - DW_FORM_addrx1 + 1));
+		const char *why = "unresolved";
+		uint64_t a = 0;
+		v->u = idx;
+		if (!r->err && addrx_lookup(e, cu, idx, &a, &why)) {
+			v->kind = V_U;
+			v->u = a;
+		} else {
+			v->kind = V_UNRES;
+			v->why = why;
+		}
+		break;
+	}
 	case DW_FORM_ref1: v->kind = V_REF; v->u = cu->cu_off + rd_u8(r); break;
 	case DW_FORM_ref2: v->kind = V_REF; v->u = cu->cu_off + rd_u16(r); break;
 	case DW_FORM_ref4: v->kind = V_REF; v->u = cu->cu_off + rd_u32(r); break;
@@ -899,6 +977,19 @@ static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
 		/* Section-relative, not CU-relative. */
 		v->kind = V_REF;
 		v->u = rd_fixed(r, cu->off_size);
+		break;
+	case DW_FORM_ref_sup4: v->kind = V_U; v->u = rd_u32(r); break;
+	case DW_FORM_ref_sup8: v->kind = V_U; v->u = rd_u64(r); break;
+	case DW_FORM_strp_sup:
+		/* String in a supplementary object file we do not have. */
+		v->kind = V_UNRES;
+		v->u = rd_fixed(r, cu->off_size);
+		v->why = "supplementary file not loaded";
+		break;
+	case DW_FORM_loclistx: case DW_FORM_rnglistx:
+		/* We read the index but do not expand the list. */
+		v->kind = V_U;
+		v->u = rd_uleb(r);
 		break;
 	case DW_FORM_exprloc: case DW_FORM_block: {
 		uint64_t n = rd_uleb(r);
@@ -915,6 +1006,19 @@ static int read_form(Rd *r, Elf *e, const Cu *cu, uint64_t form, int64_t ic,
 		v->blk = rd_take(r, (size_t)n);
 		v->blklen = v->blk ? (size_t)n : 0;
 		break;
+	}
+	case DW_FORM_indirect: {
+		/* The DIE names its own form at runtime. Recurse exactly once;
+		 * a chain of indirects is malformed and we refuse it rather than
+		 * recursing on attacker-controlled depth. */
+		uint64_t real = rd_uleb(r);
+		if (r->err)
+			return 0;
+		if (depth > 0 || real == DW_FORM_indirect) {
+			r->err = 1;
+			return 0;
+		}
+		return read_form(r, e, cu, real, 0, v, depth + 1);
 	}
 	default:
 		/* Unknown form: we cannot know its length, so the rest of this CU
@@ -1102,7 +1206,7 @@ static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
 		for (size_t i = 0; i < a->nattr; i++) {
 			Val v;
 			if (!read_form(r, e, &cu, a->attr[i].form,
-			               a->attr[i].iconst, &v)) {
+			               a->attr[i].iconst, &v, 0)) {
 				char fb[64];
 				fprintf(stderr, "dbginfo: CU @0x%" PRIx64 ": DIE 0x%"
 				        PRIx64 ": cannot decode %s (0x%" PRIx64
@@ -1113,6 +1217,12 @@ static int dump_cu(Elf *e, Rd *r, uint64_t cu_off, int *bad)
 				rc = 0;
 				goto done;
 			}
+			/* Bases must be captured as we go: later strx/addrx
+			 * attributes in this same CU resolve through them. */
+			if (a->attr[i].at == DW_AT_str_offsets_base)
+				cu.str_off_base = v.u;
+			else if (a->attr[i].at == DW_AT_addr_base)
+				cu.addr_base = v.u;
 			char ab[64];
 			printf("    %s = ",
 			       lookup(attrs, sizeof attrs / sizeof *attrs,
@@ -1246,7 +1356,7 @@ static void fv_push(FileEnt **v, size_t *n, size_t *cap, FileEnt f)
  * anything else we still have to skip by length, which read_form does. */
 static int line_entry_val(Rd *r, Elf *e, const Cu *cu, uint64_t form, Val *v)
 {
-	return read_form(r, e, cu, form, 0, v);
+	return read_form(r, e, cu, form, 0, v, 0);
 }
 
 static int dump_line_prog(Elf *e, Rd *r, uint64_t unit_off, int verbose)
@@ -1393,7 +1503,7 @@ static int dump_line_prog(Elf *e, Rd *r, uint64_t unit_off, int verbose)
 		 * empty string. */
 		for (;;) {
 			Val v;
-			if (!read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
+			if (!read_form(r, e, &cu, DW_FORM_string, 0, &v, 0)) {
 				rc = 0;
 				goto out;
 			}
@@ -1410,7 +1520,7 @@ static int dump_line_prog(Elf *e, Rd *r, uint64_t unit_off, int verbose)
 		fv_push(&files, &nfiles, &cfiles, (FileEnt){ NULL, 0 });	/* index 0 */
 		for (;;) {
 			Val v;
-			if (!read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
+			if (!read_form(r, e, &cu, DW_FORM_string, 0, &v, 0)) {
 				rc = 0;
 				goto out;
 			}
@@ -1517,7 +1627,7 @@ static int dump_line_prog(Elf *e, Rd *r, uint64_t unit_off, int verbose)
 			case 3:	/* DW_LNE_define_file (DWARF<=4) */
 				if (ver <= 4) {
 					Val v;
-					if (read_form(r, e, &cu, DW_FORM_string, 0, &v)) {
+					if (read_form(r, e, &cu, DW_FORM_string, 0, &v, 0)) {
 						FileEnt f = { v.str, rd_uleb(r) };
 						(void)rd_uleb(r);
 						(void)rd_uleb(r);
