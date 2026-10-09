@@ -135,9 +135,19 @@ Ranked, strongest first:
 
 ### Milestone 1 - the facts we print but do not yet check
 
-- [ ] Compare `DW_AT_low_pc` / `DW_AT_high_pc` per subprogram against readelf
+- [x] Compare `DW_AT_low_pc` / `DW_AT_high_pc` per subprogram against readelf
       why: addresses are the other half of what a debugger needs, and we print
       them today with nothing checking them.
+      done: and "nothing checking them" was the whole finding. The suite
+      compared tag/name pairs and line-table rows, so adding one to every
+      printed address above 0x10 passed all 65 assertions; it now fails 10 of
+      85. high_pc is compared as the raw value both tools print, which in
+      DWARF 4 and later is a length rather than an address -- comparing a
+      computed end address would be comparing two sums of the same two
+      numbers. A subprogram with no address is recorded as "-" rather than
+      skipped, so a tool that invents an address for a declaration fails
+      instead of being ignored, and the comparison asserts a nonzero count
+      because two empty lists agree.
 - [ ] Compare the decoded `--abbrev` output against `readelf --debug-dump=abbrev`
       why: the abbrev table is the one structure every other check depends on,
       and it is currently only tested indirectly.

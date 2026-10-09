@@ -71,6 +71,7 @@ binary with debug info if one exists, then for each one extracts and compares:
 |---|---|---|
 | compilation unit names | `--debug-dump=info` | `--info` |
 | (`DW_TAG_*`, `DW_AT_name`) over the whole DIE tree | `--debug-dump=info` | `--info` |
+| (name, `DW_AT_low_pc`, `DW_AT_high_pc`) per subprogram | `--debug-dump=info` | `--info` |
 | (file, line, address) per line-table row | `--debug-dump=decodedline` | `--line` |
 | is_stmt per row | `--debug-dump=decodedline` | `--line` |
 
@@ -162,7 +163,7 @@ ok   section-shrink sweep (410 runs over 5 sections, 197 rejected, 0 crashed or 
 ok   non-ELF and missing-debug-info inputs error cleanly
 ok   directory argument errors cleanly
 
-65 passed, 0 failed
+85 passed, 0 failed
 ```
 
 `make test-asan` reruns all 65 under `-fsanitize=address,undefined` (also
@@ -180,6 +181,17 @@ skipped and the suite reports 59.
 ## Status
 
 Works, and agrees with readelf on every fact it prints.
+
+Until recently that sentence was weaker than it sounded. The comparison covered
+tag and name pairs and line-table rows, and nothing at all checked an address:
+every `DW_AT_low_pc` and `DW_AT_high_pc` was printed unverified. Adding one
+to every printed address above `0x10` used to pass all 65 assertions. It now
+fails 10 of 85.
+
+`high_pc` is compared as the raw value both tools print, which in DWARF 4 and
+later is a *length* rather than an address. Comparing a computed end address
+would have been comparing two sums of the same two numbers, which is a longer
+way of checking nothing.
 
 **Supported.** DWARF 2, 3, 4 and 5 in `.debug_info` and `.debug_line`. 32-bit
 and 64-bit DWARF (`-gdwarf64` verified). `DW_UT_compile`, `DW_UT_partial`,

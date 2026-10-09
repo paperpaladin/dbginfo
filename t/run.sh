@@ -174,6 +174,66 @@ def mine_info():
                 cus.append(v)
     return cus, dies, rc
 
+# ---- subprogram address ranges, from both tools
+#
+# low_pc/high_pc is the other half of what a debugger needs from .debug_info,
+# and until now we printed it with nothing checking it. Both tools render the
+# raw value, and in DWARF 4 and later high_pc is a *length* rather than an
+# address, so what is compared is what both of them actually print rather than
+# a sum one of us computed.
+#
+# A subprogram with no address -- a declaration, or the abstract root of an
+# inlined function -- is recorded as "-" rather than skipped. Dropping them
+# would let a tool that invents an address for a declaration pass.
+def addr_triples(text, die_re, attr_re, unquote):
+    out = []
+    tag = None
+    cur = {}
+
+    def flush():
+        if tag == "DW_TAG_subprogram":
+            out.append("%s %s %s" % (cur.get("DW_AT_name", "-"),
+                                     cur.get("DW_AT_low_pc", "-"),
+                                     cur.get("DW_AT_high_pc", "-")))
+
+    for ln in text.splitlines():
+        m = re.match(die_re, ln)
+        if m:
+            flush()
+            tag = TAG_ALIAS.get(m.group(1), m.group(1))
+            cur = {}
+            continue
+        m = re.match(attr_re, ln)
+        if m and tag:
+            k, v = m.group(1), m.group(2).strip()
+            if k in ("DW_AT_name", "DW_AT_low_pc", "DW_AT_high_pc"):
+                cur[k] = unquote(v)
+    flush()
+    return sorted(out)
+
+RE_DIE = r"\s*<\d+><[0-9a-f]+>:\s+Abbrev Number:\s+\d+\s+\((\S+)\)"
+RE_ATTR = r"\s*<[0-9a-f]+>\s+(DW_AT_\w+)\s*:\s*(.*)$"
+MY_DIE = r"<\d+><0x[0-9a-f]+> (\S+)"
+MY_ATTR = r"\s+(DW_AT_\w+) = (.*)$"
+
+def strip_readelf(v):
+    # strp/line_strp/strx values carry their provenance: "(indirect string,
+    # offset: 0x57): main".
+    if v.startswith("(") and "): " in v:
+        v = v.split("): ", 1)[1]
+    return v.strip()
+
+def strip_ours(v):
+    return v[1:-1] if v.startswith('"') and v.endswith('"') else v
+
+def readelf_subs():
+    out, _ = run(["readelf", "--debug-dump=info", elf])
+    return addr_triples(out, RE_DIE, RE_ATTR, strip_readelf)
+
+def mine_subs():
+    out, _ = run([dd, "--info", elf])
+    return addr_triples(out, MY_DIE, MY_ATTR, strip_ours)
+
 # ---- readelf --debug-dump=decodedline
 # Row layout: "file  line  0xaddr  [view]  [x]". The trailing x is the Stmt
 # column; a numeric last field is the View column, meaning is_stmt is clear.
@@ -229,6 +289,7 @@ rcus, rdies, rrc = readelf_info()
 mcus, mdies, mrc = mine_info()
 rrows, rstmt, _ = readelf_lines()
 mrows, mstmt, mlrc = mine_lines()
+rsubs, msubs = readelf_subs(), mine_subs()
 
 bad = 0
 if mrc != 0:
@@ -241,6 +302,15 @@ else:
     print("ok   %s line_exit" % name)
 bad += report("cu_names", rcus, mcus, "CUs")
 bad += report("die_names", sorted(rdies), sorted(mdies), "named DIEs")
+bad += report("subprogram_pcs", rsubs, msubs, "subprograms")
+# A comparison of two empty lists agrees and proves nothing. Every fixture
+# here is compiled from C with at least a main, so zero subprograms means the
+# extractor stopped working rather than that the binary has none.
+if not rsubs:
+    print("FAIL %s subprogram_pcs_nonempty (readelf found no subprograms)" % name)
+    bad += 1
+else:
+    print("ok   %s subprogram_pcs_nonempty (%d)" % (name, len(rsubs)))
 bad += report("line_rows", rrows, mrows, "rows")
 bad += report("line_stmt", rstmt, mstmt, "rows")
 sys.exit(1 if bad else 0)
