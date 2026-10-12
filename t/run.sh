@@ -60,6 +60,16 @@ cat > "$work/src/tiny.c" <<'EOF'
 int main(void) { return 0; }
 EOF
 
+# build is always called as `add "$(build ...)"`, and command substitution
+# runs in a SUBSHELL -- so `fail=$((fail+1))` here incremented a copy and was
+# discarded. A compiler that could not build a fixture printed FAIL to stderr
+# and the suite exited 0 with that producer silently untested, its name
+# missing from $bins and skipped by the `[ -n "$b" ] || continue` below.
+#
+# The filesystem crosses the subshell boundary, so the failure is recorded
+# there and the parent checks it after all the builds.
+: > "$work/build.failures"
+
 build() {   # build NAME CC FLAGS...
 	name=$1; shift
 	if "$@" -o "$work/$name" 2>"$work/$name.cc.log"; then
@@ -67,7 +77,7 @@ build() {   # build NAME CC FLAGS...
 	else
 		printf 'FAIL could not build %s:\n' "$name" >&2
 		sed 's/^/    /' "$work/$name.cc.log" >&2
-		fail=$((fail+1))
+		echo "$name" >> "$work/build.failures"
 	fi
 }
 
@@ -341,12 +351,35 @@ for cand in $(grep -lsa -m1 '\.debug_info' /usr/bin/* /usr/lib/debug/* 2>/dev/nu
 done
 
 echo "--- oracle: readelf --debug-dump=info / =decodedline"
+# Every fixture that failed to build, counted in the parent where the
+# counter survives.
+nbuildfail=$(wc -l < "$work/build.failures")
+if [ "$nbuildfail" -gt 0 ]; then
+	printf 'FAIL %s fixture(s) did not build: %s\n' "$nbuildfail" \
+		"$(tr '\n' ' ' < "$work/build.failures")"
+	fail=$((fail + nbuildfail))
+fi
+
 for b in $bins $wild; do
 	[ -n "$b" ] || continue
-	out=$(python3 "$work/cmp.py" "$work/$b" "$b" "$DD")
+	out=$(python3 "$work/cmp.py" "$work/$b" "$b" "$DD" 2>"$work/cmp.err")
+	rc=$?
 	echo "$out"
-	pass=$((pass + $(printf '%s\n' "$out" | grep -c '^ok  ')))
-	fail=$((fail + $(printf '%s\n' "$out" | grep -c '^FAIL')))
+	nok=$(printf '%s\n' "$out" | grep -c '^ok  ')
+	nbad=$(printf '%s\n' "$out" | grep -c '^FAIL')
+	pass=$((pass + nok))
+	fail=$((fail + nbad))
+	# cmp.py's status was discarded and its traceback goes to stderr, so a
+	# Python exception -- readelf absent, a regex that stopped matching a
+	# format change, an IndexError -- produced empty stdout, added ZERO
+	# passes and ZERO failures, and the whole 8-check block for that binary
+	# vanished with the suite still green.
+	if [ "$rc" -ne 0 ] || [ "$((nok + nbad))" -eq 0 ]; then
+		printf 'FAIL cmp.py on %s exited %s and produced %s checks\n' \
+			"$b" "$rc" "$((nok + nbad))"
+		sed 's/^/    /' "$work/cmp.err" | head -5
+		fail=$((fail + 1))
+	fi
 done
 
 # ------------------------------------------------------- robustness sweep

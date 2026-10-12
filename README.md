@@ -166,7 +166,15 @@ ok   directory argument errors cleanly
 85 passed, 0 failed
 ```
 
-`make test-asan` reruns all 65 under `-fsanitize=address,undefined` (also
+The block above shows **65** of those 85 `ok` lines. The 20 absent are the
+`subprogram_pcs` and `subprogram_pcs_nonempty` pairs for each of the ten
+fixtures, added after this transcript was pasted; the total was updated and
+the body was not. Said here rather than quietly regenerated, because the
+gap is the useful fact: a transcript is evidence only for as long as someone
+re-pastes it, and ten fixtures times eight checks plus five is the
+arithmetic a reader should be able to do.
+
+`make test-asan` reruns all 85 under `-fsanitize=address,undefined` (also
 clean). `ASAN_OPTIONS=exitcode=42` is load-bearing there: ASan's default exit
 status on a report is 1, which is also our own "malformed input" status, so
 without it the harness would wave a real memory error through as a clean
@@ -176,7 +184,7 @@ The `wild` row depends on what the machine happens to have installed. Here it
 is a Go binary (`/usr/bin/host-spawn`, 80 CUs, 41409 named DIEs, 122180 line
 rows), decompressed with `objcopy --decompress-debug-sections` first because its
 debug sections are `SHF_COMPRESSED`. On a machine with no such binary the row is
-skipped and the suite reports 59.
+skipped and the suite reports 77: each fixture contributes 8 checks.
 
 ## Status
 
