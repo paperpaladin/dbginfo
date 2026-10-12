@@ -258,7 +258,8 @@ C and C++, `-O0` and `-O2`.
 
 ## Design
 
-One file, ~1800 lines (half of it the tag/attribute/form name tables), four
+One file, 1831 lines, of which the tag/attribute/form name tables and their `#define`s
+are about a fifth (lines 148-494, 347 lines) -- this said half, four
 layers, each depending only on the one below.
 
 **The cursor** (`Rd`). A buffer, a length, a position and a sticky error flag.
