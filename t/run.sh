@@ -329,7 +329,11 @@ PY
 # One binary from the wild, if the system ships one: our own fixtures are all
 # gcc/clang on tiny C, and a third-party producer at scale (Go, Rust, a
 # distro package) exercises tag/attribute codes and line tables we would never
-# generate ourselves. Skipped silently when nothing suitable is installed.
+# generate ourselves. It is the strongest oracle here -- on this machine it is
+# a Go binary with 80 CUs and 41409 named DIEs, against 85 assertions total --
+# and it used to be skipped SILENTLY when nothing suitable was installed,
+# which meant the output looked the same whether the best test in the suite
+# ran or not. Said out loud now, either way.
 wild=""
 for cand in $(grep -lsa -m1 '\.debug_info' /usr/bin/* /usr/lib/debug/* 2>/dev/null | head -20); do
 	[ -f "$cand" ] || continue
@@ -349,6 +353,11 @@ for cand in $(grep -lsa -m1 '\.debug_info' /usr/bin/* /usr/lib/debug/* 2>/dev/nu
 	echo "--- wild binary: $cand"
 	break
 done
+if [ -z "$wild" ]; then
+	printf 'SKIP no third-party binary with an uncompressed .debug_info found\n'
+	printf '     under /usr/bin or /usr/lib/debug, so the only oracle that is\n'
+	printf '     not our own gcc/clang output did not run.\n'
+fi
 
 echo "--- oracle: readelf --debug-dump=info / =decodedline"
 # Every fixture that failed to build, counted in the parent where the
