@@ -43,25 +43,25 @@ Concretely, and checked by `make test`:
 
 Ranked, strongest first:
 
-1. **`readelf --debug-dump=info` and `readelf --debug-dump=decodedline`** on
+1. `readelf --debug-dump=info` and `readelf --debug-dump=decodedline` on
    binaries we compile here with `gcc -g`, `gcc -gdwarf-4`, `gcc -gdwarf-3`,
    `gcc -gdwarf64`, `g++ -g` and `clang -g`, at `-O0` and `-O2`. binutils'
    DWARF reader is 25 years old and independently written; where we disagree,
    we are wrong. Facts are extracted from both dumps with python and compared
    as multisets - the two text formats have nothing in common and diffing them
    would only measure formatting.
-2. **The same oracle on a binary from the wild** - the harness looks for a
+2. The same oracle on a binary from the wild - the harness looks for a
    system binary with `.debug_info` (here, a Go program with 80 CUs, 41409
    named DIEs and 122180 line rows, decompressed with objcopy first). Our own
-   fixtures are all small C; a foreign producer at scale is where the
+   fixtures are all small C. A foreign producer at scale is where the
    assumptions break.
-3. **The mutation sweeps.** Whole-file truncation, 3-byte corruption at strided
+3. The mutation sweeps. Whole-file truncation, 3-byte corruption at strided
    offsets *inside* the `.debug_*` sections, and in-place `sh_size` shrinking of
    each debug section. Each sweep asserts it is non-vacuous (some mutants must
    be rejected) as well as non-fatal.
-4. **ASan + UBSan** (`make test-asan`) running the entire suite, with
+4. ASan + UBSan (`make test-asan`) running the entire suite, with
    `exitcode=42` so a sanitiser report cannot be mistaken for our own exit 1.
-5. **valgrind**, spot-checked by hand on the C++ and Go binaries.
+5. valgrind, spot-checked by hand on the C++ and Go binaries.
 
 ## Non-goals
 
@@ -116,7 +116,7 @@ Ranked, strongest first:
 - [x] Indexed and exotic forms: `strx*`, `addrx*`, `loclistx`, `indirect`
       why: clang emits indexed strings by default, so its output has no
       names in it until these exist.
-- [x] Oracle: add the clang fixture - **red**, 52 passed, 2 failed
+- [x] Oracle: add the clang fixture - red, 52 passed, 2 failed
       why: left as its own commit so the bug the oracle found is visible to
       anyone who bisects here, and so the suite has demonstrated it can fail.
 - [x] Fix: prescan the root DIE for `DW_AT_str_offsets_base` / `addr_base`
@@ -130,8 +130,8 @@ Ranked, strongest first:
       why: our fixtures can only contain constructs we thought to write; a
       foreign producer at scale is where the unknown assumption breaks.
 - [x] README, then PLAN
-      why: written last so the limitations list is observed rather than
-      guessed at.
+      why: written last so the limitations list is observed,
+      not guessed at.
 
 ### Milestone 1 - the facts we print but do not yet check
 
@@ -142,10 +142,10 @@ Ranked, strongest first:
       compared tag/name pairs and line-table rows, so adding one to every
       printed address above 0x10 passed all 65 assertions; it now fails 10 of
       85. high_pc is compared as the raw value both tools print, which in
-      DWARF 4 and later is a length rather than an address -- comparing a
+      DWARF 4 and later is a length, not an address, comparing a
       computed end address would be comparing two sums of the same two
-      numbers. A subprogram with no address is recorded as "-" rather than
-      skipped, so a tool that invents an address for a declaration fails
+      numbers. A subprogram with no address is recorded as "-",
+      not skipped, so a tool that invents an address for a declaration fails
       instead of being ignored, and the comparison asserts a nonzero count
       because two empty lists agree.
 - [ ] Compare the decoded `--abbrev` output against `readelf --debug-dump=abbrev`

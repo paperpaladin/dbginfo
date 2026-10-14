@@ -61,7 +61,7 @@ read in this program goes through one cursor with a sticky error flag, and
 ## The oracle
 
 `readelf` is the authority. binutils' DWARF reader is decades old and was
-written independently; where we disagree, we are wrong.
+written independently. Where we disagree, we are wrong.
 
 `t/run.sh` compiles fixtures with `gcc -g`, `gcc -gdwarf-4`, `gcc -gdwarf-3`,
 `gcc -gdwarf64`, `g++ -g` and `clang -g` at `-O0` and `-O2`, finds a system
@@ -166,10 +166,10 @@ ok   directory argument errors cleanly
 85 passed, 0 failed
 ```
 
-The block above shows **65** of those 85 `ok` lines. The 20 absent are the
+The block above shows 65 of those 85 `ok` lines. The 20 absent are the
 `subprogram_pcs` and `subprogram_pcs_nonempty` pairs for each of the ten
-fixtures, added after this transcript was pasted; the total was updated and
-the body was not. Said here rather than quietly regenerated, because the
+fixtures, added after this transcript was pasted. The total was updated and
+the body was not. Said here instead of quietly regenerated, because the
 gap is the useful fact: a transcript is evidence only for as long as someone
 re-pastes it, and ten fixtures times eight checks plus five is the
 arithmetic a reader should be able to do.
@@ -197,11 +197,11 @@ to every printed address above `0x10` used to pass all 65 assertions. It now
 fails 10 of 85.
 
 `high_pc` is compared as the raw value both tools print, which in DWARF 4 and
-later is a *length* rather than an address. Comparing a computed end address
+later is a *length*, not an address. Comparing a computed end address
 would have been comparing two sums of the same two numbers, which is a longer
 way of checking nothing.
 
-**Supported.** DWARF 2, 3, 4 and 5 in `.debug_info` and `.debug_line`. 32-bit
+Supported. DWARF 2, 3, 4 and 5 in `.debug_info` and `.debug_line`. 32-bit
 and 64-bit DWARF (`-gdwarf64` verified). `DW_UT_compile`, `DW_UT_partial`,
 `DW_UT_type`, `DW_UT_skeleton` headers. All 43 `DW_FORM` codes in DWARF 5,
 including `DW_FORM_implicit_const` (which gcc 14 leans on heavily),
@@ -212,44 +212,44 @@ standard opcodes, the four extended opcodes, DWARF 5's `directory_entry_format`
 tables, and VLIW `max_ops_per_instruction` address advance. `gcc` and `clang`,
 C and C++, `-O0` and `-O2`.
 
-**What does not work.**
+What does not work.
 
-- **Compressed debug sections.** `SHF_COMPRESSED` and `.zdebug_*` are refused
+- Compressed debug sections. `SHF_COMPRESSED` and `.zdebug_*` are refused
   with a diagnostic naming `objcopy --decompress-debug-sections`, because
   linking zlib is off the table. This is the common case for Go and Rust
   binaries, so the most interesting input in the wild needs a preprocessing
   step.
-- **Split DWARF.** `-gsplit-dwarf` gives you the skeleton unit and nothing
+- Split DWARF. `-gsplit-dwarf` gives you the skeleton unit and nothing
   else: we do not follow `DW_AT_dwo_name` into the `.dwo` file, and we do not
   follow `.gnu_debuglink` either. readelf does both, so this is the one case
   where it prints facts we cannot, and the one case excluded from the test
   matrix for that reason.
-- **32-bit ELF and big-endian ELF** are rejected at the magic check. The
+- 32-bit ELF and big-endian ELF are rejected at the magic check. The
   blockers are the hardcoded `Elf64_Shdr` field offsets and a little-endian-only
   `rd_fixed`.
-- **DWARF expressions are not disassembled.** `DW_AT_location` prints
+- DWARF expressions are not disassembled. `DW_AT_location` prints
   `9 byte block: 03 10 40 00 ...` where readelf prints `(DW_OP_addr: 4010)`.
   Honest, but less useful.
-- **Enumerated attribute values are printed as numbers.** `DW_AT_language = 29`,
+- Enumerated attribute values are printed as numbers. `DW_AT_language = 29`,
   not `(C11)`; likewise `DW_AT_encoding`, `DW_AT_inline`, `DW_AT_virtuality`.
-- **Location and range lists are not expanded.** `DW_FORM_loclistx`,
+- Location and range lists are not expanded. `DW_FORM_loclistx`,
   `DW_FORM_rnglistx`, `DW_AT_ranges` and `DW_AT_location` section offsets print
   the index or offset; `.debug_loclists`, `.debug_rnglists`, `.debug_loc` and
   `.debug_ranges` are never read. On `-O2` output this hides the real address
   ranges of inlined code.
-- **Sections we never look at**: `.debug_frame`/`.eh_frame` (no CFI
+- Sections we never look at: `.debug_frame`/`.eh_frame` (no CFI
   decoding at all), `.debug_macro`, `.debug_names`, `.debug_pubnames`,
   `.debug_aranges`, `.debug_types`.
-- **`DW_FORM_strp_sup` / `DW_FORM_ref_sup4` / `DW_FORM_ref_sup8`** are skipped
+- `DW_FORM_strp_sup` / `DW_FORM_ref_sup4` / `DW_FORM_ref_sup8` are skipped
   by the right number of bytes and printed as unresolved: supplementary object
   files are not loaded.
-- **Unknown codes are named, not hidden.** An unrecognised tag, attribute or
+- Unknown codes are named, not hidden. An unrecognised tag, attribute or
   form prints as `DW_TAG_unknown_0x4109` / `DW_FORM_unknown_0x2d`. An unknown
   *form* is fatal for the rest of that CU - we cannot know its length, so we
-  print a diagnostic saying the remainder is skipped rather than guessing and
+  print a diagnostic saying the remainder is skipped instead of guessing and
   emitting plausible rubbish. None of the fixtures or the Go binary hit this
   path.
-- **`DW_AT_str_offsets_base` is assumed to be 8** when a CU declares no base at
+- `DW_AT_str_offsets_base` is assumed to be 8 when a CU declares no base at
   all. The root DIE is prescanned for a real base first, so this only affects
   producers that omit the attribute entirely.
 - The line table's file column prints the file-table name, not the directory
@@ -259,36 +259,36 @@ C and C++, `-O0` and `-O2`.
 ## Design
 
 One file, 1831 lines, of which the tag/attribute/form name tables and their `#define`s
-are about a fifth (lines 148-494, 347 lines) -- this said half, four
+are about a fifth (lines 148-494, 347 lines), this said half, four
 layers, each depending only on the one below.
 
-**The cursor** (`Rd`). A buffer, a length, a position and a sticky error flag.
+The cursor (`Rd`). A buffer, a length, a position and a sticky error flag.
 Every single read of the file goes through it; `rd_take` is the only thing that
 turns an offset into a pointer. The flag is sticky so a caller can decode a
 whole structure and check once at the end - which is what keeps the error paths
 short enough to be right. Nothing in the program indexes the file buffer
 directly, and `sec_str` is the only way to obtain a `char *` from a section
-(refusing an unterminated string rather than over-reading it). That single
+(refusing an unterminated string, not over-reading it). That single
 chokepoint is why ~2000 mutants per test run produce diagnostics instead of
 segfaults.
 
-**ELF.** The whole file is read into one `malloc` buffer rather than `mmap`ed,
+ELF. The whole file is read into one `malloc` buffer, not `mmap`ed,
 specifically so that a truncated file yields our error message instead of
 `SIGBUS`. Section headers whose contents fall outside the file are recorded as
 empty with a warning, since that is the normal shape of a truncated object.
 
-**DWARF structure.** LEB128, abbreviation tables (parsed per CU, looked up by
+DWARF structure. LEB128, abbreviation tables (parsed per CU, looked up by
 linear scan - a real CU declares a handful, and a scan is immune to a hostile
 table claiming code 2^60), CU headers for both the DWARF 4 and the reshuffled
 DWARF 5 layouts, and one `read_form` covering every form. The DIE tree is
 walked iteratively with a depth counter, because the tree is already flat in the
 byte stream: a hostile file therefore cannot recurse us off the stack.
 
-**The line program.** A register set and a bytecode interpreter, kept
+The line program. A register set and a bytecode interpreter, kept
 deliberately close to the spec's own prose so the two can be read side by side.
 
 Every loop advances the cursor by at least one byte or sets the error flag,
-which is the invariant that makes "no timeout" provable rather than hoped for.
+which is the invariant that makes "no timeout" provable.
 
 Deliberate shortcuts are marked `shortcut:` in the source, each naming its
 ceiling and its upgrade path.
