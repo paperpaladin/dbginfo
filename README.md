@@ -50,7 +50,7 @@ depends on, and it is usually consumed through libdwarf or gdb, which means
 very few people have ever watched the bytes. Writing the decoder is the only
 way to find out which parts of the format are genuinely hard (the line-number
 state machine, DWARF 5's indirect string tables) and which only look hard (the
-DIE tree, which is a flat stream with an implicit depth counter).
+DIE tree, a flat stream with an implicit depth counter).
 
 It is also an exercise in parsing hostile input. A debug section is
 attacker-controlled data in any tool that reads crash dumps from strangers, and
@@ -176,7 +176,7 @@ arithmetic a reader should be able to do.
 
 `make test-asan` reruns all 85 under `-fsanitize=address,undefined` (also
 clean). `ASAN_OPTIONS=exitcode=42` is load-bearing there: ASan's default exit
-status on a report is 1, which is also our own "malformed input" status, so
+status on a report is 1, also our own "malformed input" status, so
 without it the harness would wave a real memory error through as a clean
 diagnostic.
 
@@ -198,7 +198,7 @@ fails 10 of 85.
 
 `high_pc` is compared as the raw value both tools print, which in DWARF 4 and
 later is a *length*, not an address. Comparing a computed end address
-would have been comparing two sums of the same two numbers, which is a longer
+would have been comparing two sums of the same two numbers, a longer
 way of checking nothing.
 
 Supported. DWARF 2, 3, 4 and 5 in `.debug_info` and `.debug_line`. 32-bit
