@@ -75,7 +75,7 @@ binary with debug info if one exists, then for each one extracts and compares:
 | (file, line, address) per line-table row | `--debug-dump=decodedline` | `--line` |
 | is_stmt per row | `--debug-dump=decodedline` | `--line` |
 
-The comparison is on extracted facts as multisets, never on raw text: the two
+The comparison is on extracted facts as multisets, never on raw text. The two
 output formats share nothing, and diffing them would measure formatting. The
 only normalisation applied is two tag spellings where binutils still prints the
 DWARF 3 short form (`DW_TAG_template_type_param` for
@@ -220,7 +220,7 @@ What does not work.
   binaries, so the most interesting input in the wild needs a preprocessing
   step.
 - Split DWARF. `-gsplit-dwarf` gives you the skeleton unit and nothing
-  else: we do not follow `DW_AT_dwo_name` into the `.dwo` file, and we do not
+  else. We do not follow `DW_AT_dwo_name` into the `.dwo` file, and we do not
   follow `.gnu_debuglink` either. readelf does both, so this is the one case
   where it prints facts we cannot, and the one case excluded from the test
   matrix for that reason.
