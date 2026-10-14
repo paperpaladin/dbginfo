@@ -75,9 +75,7 @@ binary with debug info if one exists, then for each one extracts and compares:
 | (file, line, address) per line-table row | `--debug-dump=decodedline` | `--line` |
 | is_stmt per row | `--debug-dump=decodedline` | `--line` |
 
-The comparison is on extracted facts as multisets, never on raw text. The two
-output formats share nothing, and diffing them would measure formatting. The
-only normalisation applied is two tag spellings where binutils still prints the
+The comparison is on extracted facts as multisets, never on raw text. Those two formats share nothing, and diffing them would measure formatting. Only one normalisation is applied, two tag spellings where binutils still prints the
 DWARF 3 short form (`DW_TAG_template_type_param` for
 `DW_TAG_template_type_parameter`) - a renderer difference, not a disagreement
 about a byte.
@@ -166,10 +164,9 @@ ok   directory argument errors cleanly
 85 passed, 0 failed
 ```
 
-The block above shows 65 of those 85 `ok` lines. The 20 absent are the
+The block above shows 65 of those 85 `ok` lines. Those 20 are the
 `subprogram_pcs` and `subprogram_pcs_nonempty` pairs for each of the ten
-fixtures, added after this transcript was pasted. The total was updated and
-the body was not. Said here instead of quietly regenerated, because the
+fixtures, added after this transcript was pasted. That total was updated and the body was not. Said here instead of quietly regenerated, because the
 gap is the useful fact: a transcript is evidence only for as long as someone
 re-pastes it, and ten fixtures times eight checks plus five is the
 arithmetic a reader should be able to do.
