@@ -176,10 +176,10 @@ ok   section-shrink sweep (410 runs over 5 sections, 197 rejected, 0 crashed or 
 ok   non-ELF and missing-debug-info inputs error cleanly
 ok   directory argument errors cleanly
 
-85 passed, 0 failed
+118 passed, 0 failed
 ```
 
-The block above shows 65 of the 118 `ok` lines the suite now prints, and its
+The block above shows 65 of the 118 `ok` lines the suite prints, and its
 total line is two revisions out of date. The 20 missing from it first were the
 `subprogram_pcs` and `subprogram_pcs_nonempty` pairs, one of each per fixture;
 the 33 after that are the `abbrev_exit`, `abbrev` and `abbrev_nonempty` triple
