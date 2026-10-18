@@ -7,6 +7,9 @@
 #   die_names  - the multiset of (DW_TAG_*, DW_AT_name) over the whole DIE tree
 #   line_rows  - the multiset of (file, line, address) from the line program
 #   line_stmt  - the is_stmt flag per row (end_sequence rows excluded, see below)
+#   abbrev     - every abbreviation declaration in .debug_abbrev, in order:
+#                table offset, code, tag, has-children, and the (attribute,
+#                form, implicit_const) list
 # Then a robustness sweep: truncations, byte corruption, and non-ELF input must
 # exit cleanly rather than crash, hang, or read out of bounds.
 set -u
@@ -121,6 +124,47 @@ if command -v clang >/dev/null; then
 	add "$(build c5 clang -g -O0 "$S/main.c" "$S/lib.c")"
 fi
 
+# A hand-assembled .debug_abbrev, and nothing else in the file.
+#
+# gcc and clang both number their abbreviation codes 1..n in declaration
+# order, so on compiler output "the code we read" and "the index of this
+# declaration" are the same number and a reader that printed the index would
+# agree with readelf everywhere. Mutating the printed code to the loop index
+# survived the whole suite until this fixture existed. DWARF puts no such
+# requirement on a producer: the codes here are 5 then 2.
+#
+# It is also the only place the unknown-code paths are reached without the
+# wild binary, which is whatever the machine happens to ship: an attribute in
+# the vendor range, a tag in the vendor range, a form that is simply not
+# allocated, and a negative DW_FORM_implicit_const. Assembling the bytes is
+# the only way to get them, since no compiler emits a code it has no name for.
+cat > "$work/src/abbrev.s" <<'ASM'
+	.section	.debug_abbrev,"",@progbits
+	.uleb128 5		/* code 5, declared first */
+	.uleb128 0x11		/* DW_TAG_compile_unit */
+	.byte	1		/* has children */
+	.uleb128 0x03		/* DW_AT_name */
+	.uleb128 0x08		/* DW_FORM_string */
+	.uleb128 0x3f01		/* vendor attribute, named by neither tool */
+	.uleb128 0x0b		/* DW_FORM_data1 */
+	.uleb128 0x3e		/* DW_AT_encoding */
+	.uleb128 0x21		/* DW_FORM_implicit_const */
+	.sleb128 -3		/* ... with a negative value */
+	.uleb128 0
+	.uleb128 0
+	.uleb128 2		/* code 2, declared second */
+	.uleb128 0x4201		/* vendor tag */
+	.byte	0		/* no children */
+	.uleb128 0x49		/* DW_AT_type */
+	.uleb128 0x13		/* DW_FORM_ref4 */
+	.uleb128 0x66		/* DW_AT_elemental */
+	.uleb128 0x2e		/* unallocated form */
+	.uleb128 0
+	.uleb128 0
+	.byte	0		/* end of table */
+ASM
+abbrev_only=$(build abbrevsyn gcc -c "$S/abbrev.s")
+
 # ---------------------------------------------------------------- extractor
 cat > "$work/cmp.py" <<'PY'
 import re, subprocess, sys
@@ -129,6 +173,9 @@ from collections import Counter
 elf = sys.argv[1]
 name = sys.argv[2]
 dd = sys.argv[3]
+# "abbrev" restricts the run to the .debug_abbrev comparison, for a fixture
+# that is nothing but a hand-assembled abbrev section.
+only_abbrev = len(sys.argv) > 4 and sys.argv[4] == "abbrev"
 
 def run(cmd):
     p = subprocess.run(cmd, capture_output=True, text=True)
@@ -244,6 +291,78 @@ def mine_subs():
     out, _ = run([dd, "--info", elf])
     return addr_triples(out, MY_DIE, MY_ATTR, strip_ours)
 
+# ---- the abbreviation tables, from both tools
+#
+# Every other check in this file reads .debug_abbrev indirectly: a tag or a
+# form decoded wrongly here comes out as a wrong tag name or a wrong attribute
+# value downstream. Indirectly is not the same as checked, though -- an
+# attribute whose form we mis-size but whose value nothing compares (anything
+# that is not DW_AT_name or a pc) disappears, and a table we skip entirely
+# vanishes with it, because nothing counts the tables.
+#
+# Both tools walk the section from offset 0 to the end, so the record list is
+# compared in order rather than as a set: the sequence of codes within a table
+# and the sequence of tables within the section are themselves facts.
+#
+# Two renderer differences are normalised, neither of them about a byte:
+# binutils' DWARF3-era short tag spellings (TAG_ALIAS, shared with the DIE
+# comparison above), and the way the two tools spell a code they do not know
+# -- readelf writes "Unknown AT value: 2905", we write
+# "DW_AT_unknown_0x2905". The wild Go binary has 2905 in it, so this is a
+# case the corpus reaches, not a precaution.
+def abbrev_records(text, tab_re, decl_re, attr_prefix):
+    recs = []
+    off = None
+    indecl = False
+    for ln in text.splitlines():
+        # readelf writes a code it has no name for as three words, with a
+        # different first word for the vendor range ("Unknown AT value: 3f01",
+        # "User TAG value: 0x4201"); we write one word. Fold readelf's spelling
+        # to ours before anything is matched or split. Our own output contains
+        # neither phrase, so this runs over both and changes only one.
+        ln = re.sub(r"(?:Unknown|User) (TAG|AT|FORM) value: (?:0x)?([0-9a-f]+)",
+                    r"DW_\1_unknown_0x\2", ln)
+        m = re.match(tab_re, ln)
+        if m:
+            off = int(m.group(1), 0)
+            indecl = False
+            continue
+        m = re.match(decl_re, ln)
+        if m:
+            tag = TAG_ALIAS.get(m.group(2), m.group(2))
+            kids = "children" if m.group(3) in ("children", "has children") \
+                   else "nochildren"
+            recs.append("@0x%x [%s] %s %s" % (off, m.group(1), tag, kids))
+            indecl = True
+            continue
+        if not indecl or not ln.strip():
+            continue
+        l = re.sub(r"(DW_AT|DW_FORM) value: (\d+)", r"\1_value_\2", ln)
+        p = l.split()
+        if len(p) < 2 or not p[0].startswith(attr_prefix):
+            recs.append("UNPARSED " + ln)
+            continue
+        if p[0] == "DW_AT_value_0":      # the end-of-declaration terminator
+            continue
+        # DW_FORM_implicit_const prints its value as "DW_FORM_implicit_const: 1"
+        recs.append("    %s %s%s" % (p[0], p[1].rstrip(":"),
+                                     (": " + p[2]) if len(p) > 2 else ""))
+    return recs
+
+def readelf_abbrev():
+    out, _ = run(["readelf", "--debug-dump=abbrev", elf])
+    return abbrev_records(out,
+                          r"\s*Number TAG \((0x[0-9a-f]+|\d+)\)",
+                          r"\s+(\d+)\s+(\S+)\s+\[(no children|has children)\]\s*$",
+                          "DW_AT")
+
+def mine_abbrev():
+    out, rc = run([dd, "--abbrev", elf])
+    return abbrev_records(out,
+                          r"table @(0x[0-9a-f]+) ",
+                          r"  \[(\d+)\] (\S+) \[(children|no children)\]\s*$",
+                          "DW_AT"), rc
+
 # ---- readelf --debug-dump=decodedline
 # Row layout: "file  line  0xaddr  [view]  [x]". The trailing x is the Stmt
 # column; a numeric last field is the View column, meaning is_stmt is clear.
@@ -295,13 +414,33 @@ def report(check, a, b, kind="set"):
         print("       ours   =%r" % (b,))
     return 1
 
-rcus, rdies, rrc = readelf_info()
-mcus, mdies, mrc = mine_info()
-rrows, rstmt, _ = readelf_lines()
-mrows, mstmt, mlrc = mine_lines()
-rsubs, msubs = readelf_subs(), mine_subs()
+rabbrev = readelf_abbrev()
+mabbrev, marc = mine_abbrev()
+if not only_abbrev:
+    rcus, rdies, rrc = readelf_info()
+    mcus, mdies, mrc = mine_info()
+    rrows, rstmt, _ = readelf_lines()
+    mrows, mstmt, mlrc = mine_lines()
+    rsubs, msubs = readelf_subs(), mine_subs()
 
 bad = 0
+if marc != 0:
+    print("FAIL %s abbrev_exit (dbginfo --abbrev exited %d)" % (name, marc)); bad += 1
+else:
+    print("ok   %s abbrev_exit" % name)
+bad += report("abbrev", rabbrev, mabbrev, "declaration lines")
+# Both tools printing nothing is agreement that proves nothing: a missing
+# .debug_abbrev, a regex that stopped matching, or an extractor pointed at the
+# wrong file all read as a pass. Every binary here has an abbrev section, so
+# readelf finding no declaration means the extractor broke.
+if not rabbrev:
+    print("FAIL %s abbrev_nonempty (readelf found no abbrev declarations)" % name)
+    bad += 1
+else:
+    print("ok   %s abbrev_nonempty (%d)" % (name, len(rabbrev)))
+if only_abbrev:
+    sys.exit(1 if bad else 0)
+
 if mrc != 0:
     print("FAIL %s info_exit (dbginfo --info exited %d)" % (name, mrc)); bad += 1
 else:
@@ -369,9 +508,11 @@ if [ "$nbuildfail" -gt 0 ]; then
 	fail=$((fail + nbuildfail))
 fi
 
-for b in $bins $wild; do
+for b in $bins $wild $abbrev_only; do
 	[ -n "$b" ] || continue
-	out=$(python3 "$work/cmp.py" "$work/$b" "$b" "$DD" 2>"$work/cmp.err")
+	mode=""
+	[ "$b" = "$abbrev_only" ] && mode="abbrev"
+	out=$(python3 "$work/cmp.py" "$work/$b" "$b" "$DD" $mode 2>"$work/cmp.err")
 	rc=$?
 	echo "$out"
 	nok=$(printf '%s\n' "$out" | grep -c '^ok  ')
@@ -381,9 +522,18 @@ for b in $bins $wild; do
 	# cmp.py's status was discarded and its traceback goes to stderr, so a
 	# Python exception -- readelf absent, a regex that stopped matching a
 	# format change, an IndexError -- produced empty stdout, added ZERO
-	# passes and ZERO failures, and the whole 8-check block for that binary
+	# passes and ZERO failures, and the whole check block for that binary
 	# vanished with the suite still green.
-	if [ "$rc" -ne 0 ] || [ "$((nok + nbad))" -eq 0 ]; then
+	#
+	# The first version of this guard fired on `rc != 0` alone, and cmp.py
+	# exits 1 for an ordinary disagreement too. So every real failure was
+	# counted twice and printed a second line saying cmp.py "exited 1 and
+	# produced 11 checks", which is the guard contradicting itself: it had
+	# produced checks. Caught by a planted mutation here, which reported 20
+	# failures for 10 broken fixtures. What is actually wrong is a run that
+	# produced no checks at all, or one that died partway through: nonzero
+	# status with no FAIL line of its own to explain it.
+	if [ "$((nok + nbad))" -eq 0 ] || { [ "$rc" -ne 0 ] && [ "$nbad" -eq 0 ]; }; then
 		printf 'FAIL cmp.py on %s exited %s and produced %s checks\n' \
 			"$b" "$rc" "$((nok + nbad))"
 		sed 's/^/    /' "$work/cmp.err" | head -5

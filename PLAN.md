@@ -148,9 +148,30 @@ Ranked, strongest first:
       not skipped, so a tool that invents an address for a declaration fails
       instead of being ignored, and the comparison asserts a nonzero count
       because two empty lists agree.
-- [ ] Compare the decoded `--abbrev` output against `readelf --debug-dump=abbrev`
+- [x] Compare the decoded `--abbrev` output against `readelf --debug-dump=abbrev`
       why: the abbrev table is the one structure every other check depends on,
       and it is currently only tested indirectly.
+      done: every declaration in the section, in order, as
+      `@offset [code] TAG children` plus one line per (attribute, form,
+      implicit_const value), compared as an ordered list because the sequence
+      of codes within a table and of tables within the section are facts too.
+      Three renderer differences are folded, none about a byte: the two
+      DWARF3-era short tag spellings already shared with the DIE comparison,
+      and readelf's two multi-word forms for a code it cannot name
+      ("Unknown AT value: 3f01", "User TAG value: 0x4201") against our
+      `DW_AT_unknown_0x3f01`.
+      The surprise was that gcc and clang both number abbreviation codes 1..n
+      in declaration order, so printing the loop index instead of the code
+      agreed with readelf on all ten binaries and survived. DWARF requires no
+      such thing, so the fixture `abbrevsyn` is a hand-assembled
+      `.debug_abbrev` and nothing else: codes 5 then 2, a vendor attribute, a
+      vendor tag, an unallocated form, and a negative
+      `DW_FORM_implicit_const`. It kills that mutant and is the only place the
+      unknown-code paths are reached when the machine ships no wild binary.
+      Also fixed a harness bug the mutation runs exposed: the guard meant to
+      catch a cmp.py crash fired on `rc != 0` alone, and cmp.py exits 1 for an
+      ordinary disagreement, so every real failure was counted twice. Ten
+      broken fixtures reported 20 failures. 85 -> 118 checks.
 - [ ] Compare `DW_AT_type` reference targets, by resolving each reference and
       checking both tools name the same DIE
       why: a CU-relative vs section-relative mix-up in `DW_FORM_ref4` would

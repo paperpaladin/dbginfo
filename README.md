@@ -72,13 +72,23 @@ binary with debug info if one exists, then for each one extracts and compares:
 | compilation unit names | `--debug-dump=info` | `--info` |
 | (`DW_TAG_*`, `DW_AT_name`) over the whole DIE tree | `--debug-dump=info` | `--info` |
 | (name, `DW_AT_low_pc`, `DW_AT_high_pc`) per subprogram | `--debug-dump=info` | `--info` |
+| every abbreviation declaration: offset, code, tag, children, (attribute, form, implicit value) | `--debug-dump=abbrev` | `--abbrev` |
 | (file, line, address) per line-table row | `--debug-dump=decodedline` | `--line` |
 | is_stmt per row | `--debug-dump=decodedline` | `--line` |
 
-The comparison is on extracted facts as multisets, never on raw text. Those two formats share nothing, and diffing them would measure formatting. Only one normalisation is applied, two tag spellings where binutils still prints the
-DWARF 3 short form (`DW_TAG_template_type_param` for
-`DW_TAG_template_type_parameter`) - a renderer difference, not a disagreement
-about a byte.
+The comparison is on extracted facts as multisets, never on raw text. Those
+two formats share nothing, and diffing them would measure formatting. The
+abbreviation comparison is the one ordered list rather than a multiset,
+because the order of codes within a table and of tables within the section
+are facts in themselves.
+
+Two normalisations are applied, neither about a byte. Binutils still prints
+the DWARF 3 short form for two tags (`DW_TAG_template_type_param` for
+`DW_TAG_template_type_parameter`). And where a code has no name, readelf
+writes three words with a different first one for the vendor range
+(`Unknown AT value: 3f01`, `User TAG value: 0x4201`) against our
+`DW_AT_unknown_0x3f01`. The fold runs in one direction only: a code we name
+and readelf does not is a disagreement and fails.
 
 The oracle has already earned its keep. It caught dbginfo resolving clang's
 *second* compilation unit's strings against the *first* unit's
@@ -164,14 +174,17 @@ ok   directory argument errors cleanly
 85 passed, 0 failed
 ```
 
-The block above shows 65 of those 85 `ok` lines. Those 20 are the
-`subprogram_pcs` and `subprogram_pcs_nonempty` pairs for each of the ten
-fixtures, added after this transcript was pasted. That total was updated and the body was not. Said here instead of quietly regenerated, because the
-gap is the useful fact: a transcript is evidence only for as long as someone
-re-pastes it, and ten fixtures times eight checks plus five is the
+The block above shows 65 of the 118 `ok` lines the suite now prints, and its
+total line is two revisions out of date. The 20 missing from it first were the
+`subprogram_pcs` and `subprogram_pcs_nonempty` pairs, one of each per fixture;
+the 33 after that are the `abbrev_exit`, `abbrev` and `abbrev_nonempty` triple
+for the ten fixtures, plus the three the `abbrevsyn` fixture contributes on
+its own. Said here instead of quietly regenerated, because the gap is the
+useful fact: a transcript is evidence only for as long as someone re-pastes
+it, and ten fixtures times eleven checks, plus three, plus five, is the
 arithmetic a reader should be able to do.
 
-`make test-asan` reruns all 85 under `-fsanitize=address,undefined` (also
+`make test-asan` reruns all 118 under `-fsanitize=address,undefined` (also
 clean). `ASAN_OPTIONS=exitcode=42` is load-bearing there: ASan's default exit
 status on a report is 1, also our own "malformed input" status, so
 without it the harness would wave a real memory error through as a clean
@@ -181,7 +194,19 @@ The `wild` row depends on what the machine happens to have installed. Here it
 is a Go binary (`/usr/bin/host-spawn`, 80 CUs, 41409 named DIEs, 122180 line
 rows), decompressed with `objcopy --decompress-debug-sections` first because its
 debug sections are `SHF_COMPRESSED`. On a machine with no such binary the row is
-skipped and the suite reports 77: each fixture contributes 8 checks.
+skipped and the suite reports 107: each fixture contributes 11 checks.
+
+One fixture is not compiled from C at all. `abbrevsyn` is a hand-assembled
+`.debug_abbrev` section with nothing else in the file, and it exists because
+of a mutant that survived everything else: gcc and clang both number their
+abbreviation codes 1..n in declaration order, so a reader that printed the
+index of a declaration instead of the code it read agreed with readelf on all
+ten real binaries. DWARF imposes no such numbering. The fixture declares code
+5 before code 2, and carries the other constructs no compiler will emit on
+request: an attribute and a tag in the vendor ranges, a form that is not
+allocated at all, and a negative `DW_FORM_implicit_const`. It contributes 3
+checks and is the only place the unknown-code paths are reached when no wild
+binary is installed.
 
 ## Status
 
@@ -197,6 +222,15 @@ fails 10 of 85.
 later is a *length*, not an address. Comparing a computed end address
 would have been comparing two sums of the same two numbers, a longer
 way of checking nothing.
+
+The abbreviation tables were in the same position until the check above was
+written. They are read by everything, so the argument was that a defect there
+shows up downstream, and for part of the structure that is true: an abbrev
+code read wrongly picks the wrong declaration and the DIE names go wrong.
+It is not true of what the table says about attributes nothing else compares.
+Printing `[no children]` for every declaration, adding one to every
+`DW_FORM_implicit_const` value, and printing a negative implicit value as
+unsigned were each invisible to all 85 earlier checks and each fail now.
 
 Supported. DWARF 2, 3, 4 and 5 in `.debug_info` and `.debug_line`. 32-bit
 and 64-bit DWARF (`-gdwarf64` verified). `DW_UT_compile`, `DW_UT_partial`,
