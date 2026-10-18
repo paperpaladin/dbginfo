@@ -73,6 +73,11 @@ binary with debug info if one exists, then for each one extracts and compares:
 | (`DW_TAG_*`, `DW_AT_name`) over the whole DIE tree | `--debug-dump=info` | `--info` |
 | (name, `DW_AT_low_pc`, `DW_AT_high_pc`) per subprogram | `--debug-dump=info` | `--info` |
 | every abbreviation declaration: offset, code, tag, children, (attribute, form, implicit value) | `--debug-dump=abbrev` | `--abbrev` |
+
+2778 abbreviation declaration lines across the eleven binaries agree with
+binutils. The number is here because the commit that added the comparison
+claimed 2673 in its message, a figure written down rather than measured; the
+suite prints the per-binary counts and they add up to 2778.
 | (file, line, address) per line-table row | `--debug-dump=decodedline` | `--line` |
 | is_stmt per row | `--debug-dump=decodedline` | `--line` |
 
