@@ -563,6 +563,24 @@ static uint8_t *read_file(const char *path, size_t *out_len)
 		}
 	}
 	fclose(f);
+	/* Trim to the exact length. The buffer doubles, so a 17 KB file sits in
+	 * a 32 KB allocation and a read one byte past the end of the FILE lands
+	 * 15 KB inside a live allocation: ASan sees a legitimate access and
+	 * says nothing. Every length in DWARF comes out of the file itself, so
+	 * this one realloc is what makes an off-by-one here a sanitizer report
+	 * rather than a plausible wrong answer. `make overread` holds it in
+	 * place by requiring the report. A zero-byte file gets no buffer at
+	 * all rather than a one-byte one, since one spare byte is the same
+	 * blindness in miniature; nothing can read it either way, because the
+	 * cursor refuses every read at len 0 and elf_load dies on the magic. */
+	if (len == 0) {
+		free(buf);
+		buf = NULL;
+	} else {
+		uint8_t *nb = realloc(buf, len);
+		if (nb)
+			buf = nb;	/* a shrink that fails leaves buf usable */
+	}
 	*out_len = len;
 	return buf;
 }
@@ -597,6 +615,17 @@ static void elf_load(Elf *e, const char *path)
 {
 	memset(e, 0, sizeof *e);
 	e->file = read_file(path, &e->flen);
+#ifdef DBGINFO_PLANT_OVERREAD
+	/* Not a defect: a deliberate read one byte past the end of the file,
+	 * compiled in only for `make overread`. Every DWARF structure below
+	 * has its length taken from the file itself, so the sanitizer's view
+	 * of where the file ENDS is the only thing standing between an
+	 * off-by-one and a silent wrong answer. If read_file hands back a
+	 * buffer rounded up to the next power of two, this read lands tens of
+	 * kilobytes inside a live allocation and ASan says nothing. */
+	fprintf(stderr, "dbginfo: probe: byte past end of file = 0x%02x\n",
+	        e->file[e->flen]);
+#endif
 	Rd r = rd_at(e->file, e->flen, 0);
 	const uint8_t *id = rd_take(&r, 16);
 	if (!id)

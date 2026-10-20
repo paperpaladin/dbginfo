@@ -177,6 +177,7 @@ ok   non-ELF and missing-debug-info inputs error cleanly
 ok   directory argument errors cleanly
 
 118 passed, 0 failed
+[overread] the sanitizer sees the end of the file buffer
 ```
 
 The block above shows 65 of the 118 `ok` lines the suite prints, and its
@@ -194,6 +195,33 @@ clean). `ASAN_OPTIONS=exitcode=42` is load-bearing there: ASan's default exit
 status on a report is 1, also our own "malformed input" status, so
 without it the harness would wave a real memory error through as a clean
 diagnostic.
+
+That clean run used to mean less than it looked. `read_file` grows its buffer
+by doubling and returned it untrimmed, so a 17 KB file sat in a 32 KB
+allocation and a read one byte past the end of the FILE landed 15 KB inside a
+live allocation. ASan saw a legitimate access and said nothing. This is the
+worst possible place for it: every length in DWARF comes out of the file
+itself, so the one off-by-one most likely to exist here is the one the
+sanitizer was switched off for.
+
+It was measured, not reasoned about. A deliberate `e->file[e->flen]` behind
+`-DDBGINFO_PLANT_OVERREAD` produced, untrimmed, exactly one line of output -
+the probe's own `printf` - and exit 0. With one `realloc` down to `len` after
+the read loop the same read is a `heap-buffer-overflow`, `READ of size 1`,
+`0 bytes after 16928-byte region`, exit 42.
+
+`make overread` is that probe as a gate, counted separately from the 118
+because it is a claim about the sanitizer rather than about DWARF. It is run
+by `make test`. Deleting the `realloc` turns it red and leaves the oracle
+suite reporting `118 passed, 0 failed`, which is the point: nothing else in
+the harness can see the difference between a sanitizer that is watching the
+end of the file and one that is not.
+
+A zero-byte file gets no buffer at all rather than a one-byte one. One spare
+byte is the same blindness in miniature, and nothing can read it either way:
+the cursor refuses every read at length 0 and `elf_load` dies on the magic
+first. `/dev/null` and an empty file both error cleanly under ASan with leak
+detection on.
 
 The `wild` row depends on what the machine happens to have installed. Here it
 is a Go binary (`/usr/bin/host-spawn`, 80 CUs, 41409 named DIEs, 122180 line
@@ -273,6 +301,14 @@ What does not work.
   the index or offset; `.debug_loclists`, `.debug_rnglists`, `.debug_loc` and
   `.debug_ranges` are never read. On `-O2` output this hides the real address
   ranges of inlined code.
+- The sanitizer can see the end of the file and not the end of a section.
+  The trim above makes an over-read past the last byte of the file a report;
+  a read that walks off the end of `.debug_info` and into `.debug_abbrev` is
+  still inside one live allocation and no sanitizer can see it. Only the
+  cursor's own length check stands there, which is why the truncation,
+  corruption and section-shrink sweeps exist. Copying each section into its
+  own exactly sized allocation under a debug flag, the way `jsonc` does with
+  `-DJSONC_ARENA_DEBUG`, would close it; that is not done.
 - Sections we never look at: `.debug_frame`/`.eh_frame` (no CFI
   decoding at all), `.debug_macro`, `.debug_names`, `.debug_pubnames`,
   `.debug_aranges`, `.debug_types`.
@@ -294,7 +330,7 @@ What does not work.
 
 ## Design
 
-One file, 1831 lines, of which the tag/attribute/form name tables and their `#define`s
+One file, 1860 lines, of which the tag/attribute/form name tables and their `#define`s
 are about a fifth (lines 148-494, 347 lines), this said half, four
 layers, each depending only on the one below.
 
@@ -310,8 +346,11 @@ segfaults.
 
 ELF. The whole file is read into one `malloc` buffer, not `mmap`ed,
 specifically so that a truncated file yields our error message instead of
-`SIGBUS`. Section headers whose contents fall outside the file are recorded as
-empty with a warning, since that is the normal shape of a truncated object.
+`SIGBUS`. The buffer is `realloc`ed down to the exact file length after the
+read loop, because a buffer larger than its data turns the sanitizer off; see
+`make overread`. Section headers whose contents fall outside the file are
+recorded as empty with a warning, since that is the normal shape of a
+truncated object.
 
 DWARF structure. LEB128, abbreviation tables (parsed per CU, looked up by
 linear scan - a real CU declares a handful, and a scan is immune to a hostile

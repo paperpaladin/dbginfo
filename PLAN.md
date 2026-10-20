@@ -172,6 +172,40 @@ Ranked, strongest first:
       catch a cmp.py crash fired on `rc != 0` alone, and cmp.py exits 1 for an
       ordinary disagreement, so every real failure was counted twice. Ten
       broken fixtures reported 20 failures. 85 -> 118 checks.
+- [x] Trim the file buffer to the exact length, and gate it with `make overread`
+      why: `read_file` grows by doubling and returned the buffer untrimmed, so
+      every DWARF parse ran with up to 2x slack that ASan treats as
+      legitimately allocated. A read past the real end of the file was
+      invisible, in the one program whose every length comes out of the file
+      it is reading. The tenth instance of this shape found in the
+      collection.
+      done: measured before fixing. A deliberate `e->file[e->flen]` behind
+      `-DDBGINFO_PLANT_OVERREAD`, built with `-fsanitize=address,undefined`,
+      printed one line (its own probe `printf`) and exited 0. After one
+      `realloc` down to `len` the same read is
+      `heap-buffer-overflow / READ of size 1 / 0 bytes after 16928-byte
+      region`, exit 42. `make overread` compiles the probe and FAILS unless
+      the sanitizer reports it; `make test` runs it. Removing the `realloc`
+      turns it red while `t/run.sh` still prints `118 passed, 0 failed`, so
+      the gate is the only thing in the harness that can see the difference.
+      A zero-length file gets no buffer rather than a one-byte one, since one
+      spare byte is the same blindness smaller.
+      Then the corpus was re-run with the sanitizer able to see the file end,
+      looking for a real defect behind the blind spot. Nothing new: the suite
+      is clean under `make test-asan` (118), 89 DWARF-bearing binaries from
+      the sibling repositories all parse clean, and 3600 mutants over the
+      largest of them (1600 random truncations and whole-file bit flips, plus
+      2000 bit flips and 0xff/0x00 runs placed inside `.debug_*`) produced
+      zero sanitizer reports and zero abnormal exits. The `rd_take`
+      chokepoint was holding. The blind spot was real; the bug behind it was
+      not there.
+- [ ] Give each section its own exactly sized allocation under a debug flag
+      why: the trim above makes the end of the FILE visible to ASan and
+      nothing more. A read that walks off `.debug_info` into `.debug_abbrev`
+      is still inside one live allocation, which is the arena problem `jsonc`
+      answers with `-DJSONC_ARENA_DEBUG`: copy each section out under a flag,
+      run the suite both ways, and the section boundaries become sanitizer
+      boundaries. Today only the cursor's length check stands there.
 - [ ] Compare `DW_AT_type` reference targets, by resolving each reference and
       checking both tools name the same DIE
       why: a CU-relative vs section-relative mix-up in `DW_FORM_ref4` would

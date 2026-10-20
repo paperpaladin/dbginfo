@@ -16,6 +16,29 @@ dbginfo-asan: dbginfo.c
 
 test: dbginfo
 	./t/run.sh
+	@$(MAKE) --no-print-directory overread
+
+# A buffer larger than its data turns the sanitizer off. read_file trims the
+# whole-file buffer down to the exact length for exactly that reason, and this
+# target asserts the consequence instead of trusting it: the same source with a
+# deliberate read one byte past the end of the file must be REPORTED. Untrimmed
+# the buffer doubles, so that read lands tens of kilobytes inside a live
+# allocation, ASan is silent, and a clean test-asan run would say nothing about
+# any of the lengths this program takes out of the DWARF sections themselves.
+overread: dbginfo.c dbginfo
+	@$(CC) -std=c11 -Wall -Wextra $(ASAN) -DDBGINFO_PLANT_OVERREAD \
+	  -o dbginfo-probe dbginfo.c
+	@if ASAN_OPTIONS=detect_leaks=0 ./dbginfo-probe --sections ./dbginfo 2>&1 \
+	    | grep -q 'runtime error\|Sanitizer'; then \
+	  echo '[overread] the sanitizer sees the end of the file buffer'; \
+	else \
+	  echo 'FAIL [overread] a read one byte past the end of the file is'; \
+	  echo '      invisible: read_file returned a buffer larger than the'; \
+	  echo '      file, so the sanitizer is switched off over every length'; \
+	  echo '      this program reads out of the DWARF sections'; \
+	  rm -f dbginfo-probe; exit 1; \
+	fi
+	@rm -f dbginfo-probe
 
 # exitcode=42 is load-bearing: ASan's default exit status on a report is 1,
 # which is also our own "malformed input" status, so without it the harness
@@ -26,6 +49,6 @@ test-asan: dbginfo-asan
 	DD=$(CURDIR)/dbginfo-asan ./t/run.sh
 
 clean:
-	rm -f dbginfo dbginfo-asan
+	rm -f dbginfo dbginfo-asan dbginfo-probe
 
-.PHONY: all test test-asan clean
+.PHONY: all test test-asan overread clean

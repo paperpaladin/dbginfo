@@ -2,3 +2,4 @@ dbginfo
 dbginfo-asan
 *.o
 *.bin
+dbginfo-probe
