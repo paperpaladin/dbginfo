@@ -14,9 +14,12 @@ dbginfo: dbginfo.c
 dbginfo-asan: dbginfo.c
 	$(CC) -std=c11 -Wall -Wextra $(ASAN) -o $@ $<
 
+# The gate runs BEFORE the suite, so that make stops on it rather than running
+# 118 checks whose sanitizer coverage is in doubt, and so that the suite's own
+# total is still the last line of the output: commitq reports the last line.
 test: dbginfo
-	./t/run.sh
 	@$(MAKE) --no-print-directory overread
+	./t/run.sh
 
 # A buffer larger than its data turns the sanitizer off. read_file trims the
 # whole-file buffer down to the exact length for exactly that reason, and this

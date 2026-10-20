@@ -106,6 +106,7 @@ DIE for the bases before decoding any attribute.
 ```
 $ make test
 cc -std=c11 -O2 -g -Wall -Wextra -Wshadow -Wpedantic -o dbginfo dbginfo.c
+[overread] the sanitizer sees the end of the file buffer
 ./t/run.sh
 --- wild binary: /usr/bin/host-spawn
 --- oracle: readelf --debug-dump=info / =decodedline
@@ -177,7 +178,6 @@ ok   non-ELF and missing-debug-info inputs error cleanly
 ok   directory argument errors cleanly
 
 118 passed, 0 failed
-[overread] the sanitizer sees the end of the file buffer
 ```
 
 The block above shows 65 of the 118 `ok` lines the suite prints, and its
